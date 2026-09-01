@@ -717,9 +717,7 @@ impl VllmPDRouter {
         // This is required even when logprobs are not requested because decode-side
         // cached_tokens can temporarily report invalid placeholders like -1 and would
         // otherwise override the valid value from prefill.
-        debug!(
-            "Non-streaming PD response: normalizing usage and optional logprobs before return"
-        );
+        debug!("Non-streaming PD response: normalizing usage and optional logprobs before return");
 
         let resp_headers = decode_response.headers().clone();
         let decode_body = decode_response
@@ -727,8 +725,22 @@ impl VllmPDRouter {
             .await
             .map_err(|e| format!("Failed to read decode response: {}", e))?;
 
-        let mut decode_json: Value = serde_json::from_slice(&decode_body)
-            .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
+        let mut decode_json: Value = match serde_json::from_slice(&decode_body) {
+            Ok(json) => json,
+            Err(_) => {
+                let mut response_builder = axum::http::Response::builder().status(status);
+                for (name, value) in resp_headers.iter() {
+                    if name != axum::http::header::CONTENT_LENGTH
+                        && name != axum::http::header::TRANSFER_ENCODING
+                    {
+                        response_builder = response_builder.header(name, value);
+                    }
+                }
+                return response_builder
+                    .body(axum::body::Body::from(decode_body))
+                    .map_err(|e| format!("Failed to build response from decode: {}", e));
+            }
+        };
 
         let empty_json = Value::Null;
         let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
@@ -753,7 +765,11 @@ impl VllmPDRouter {
 
         let mut response_builder = axum::http::Response::builder().status(status);
         for (name, value) in resp_headers.iter() {
-            response_builder = response_builder.header(name, value);
+            if name != axum::http::header::CONTENT_LENGTH
+                && name != axum::http::header::TRANSFER_ENCODING
+            {
+                response_builder = response_builder.header(name, value);
+            }
         }
         response_builder
             .body(axum::body::Body::from(merged_body))
@@ -1494,7 +1510,9 @@ impl VllmPDRouter {
         // For non-streaming responses, always prefer the prefill-side cached token metadata
         // if the decode-side value is missing or invalid (for example, -1 from a partial decode).
         if !is_streaming {
-            debug!("Non-streaming PD response: merging usage metadata from prefill into decode result");
+            debug!(
+                "Non-streaming PD response: merging usage metadata from prefill into decode result"
+            );
 
             let decode_body =
                 decode_response
@@ -1507,10 +1525,22 @@ impl VllmPDRouter {
                         ),
                     })?;
 
-            let mut decode_json: Value =
-                serde_json::from_slice(&decode_body).map_err(|e| PDRouterError::NetworkError {
-                    message: format!("Failed to parse decode response as JSON: {}", e),
-                })?;
+            let mut decode_json: Value = match serde_json::from_slice(&decode_body) {
+                Ok(json) => json,
+                Err(_) => {
+                    let mut response_builder = Response::builder().status(status);
+                    for (key, value) in headers.iter() {
+                        if key != "transfer-encoding" && key != "content-length" {
+                            response_builder = response_builder.header(key, value);
+                        }
+                    }
+                    return response_builder.body(Body::from(decode_body)).map_err(|e| {
+                        PDRouterError::NetworkError {
+                            message: format!("Failed to build response from {}: {}", decode_url, e),
+                        }
+                    });
+                }
+            };
 
             let merged_usage =
                 logprobs_merge::merge_usage_in_json(&prefill_response_json, &mut decode_json);

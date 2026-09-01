@@ -57,7 +57,7 @@ pub fn merge_usage_in_json(prefill_json: &Value, decode_json: &mut Value) -> boo
     };
 
     let should_replace = match decode_details_obj.get("cached_tokens") {
-        Some(existing) => existing.as_i64().map_or(true, |v| v <= 0),
+        Some(existing) => existing.as_i64().is_none_or(|v| v <= 0),
         None => true,
     };
 
@@ -549,7 +549,10 @@ mod tests {
 
         let merged = merge_usage_in_json(&prefill_json, &mut decode_json);
         assert!(merged);
-        assert_eq!(decode_json["usage"]["prompt_tokens_details"]["cached_tokens"], json!(50));
+        assert_eq!(
+            decode_json["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(50)
+        );
     }
 
     #[test]
