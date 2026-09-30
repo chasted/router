@@ -73,53 +73,62 @@ pub fn merge_usage_in_json(prefill_json: &Value, decode_json: &mut Value) -> boo
     false
 }
 
-/// SSE 数据行的前缀（不含冒号后的空格）。
+/// Prefix of an SSE data line (excluding the space after the colon).
 const SSE_DATA_PREFIX: &str = "data:";
 
-/// 流结束标记，由 vLLM 在最后一个 data 事件后发出。
+/// End-of-stream marker, emitted by vLLM after the last data event.
 const SSE_DONE: &str = "[DONE]";
 
-/// 取出 `data:` 行的负载（`[DONE]` 这类非 JSON 负载原样返回）。
+/// Extract the payload of a `data:` line (`[DONE]` and other non-JSON payloads are
+/// returned verbatim).
 fn sse_payload(line: &str) -> Option<&str> {
     let rest = line.strip_prefix(SSE_DATA_PREFIX)?;
     Some(rest.strip_prefix(' ').unwrap_or(rest))
 }
 
-/// 该行是否为**携带非 null usage 对象**的 JSON 事件。
+/// Whether the line is a JSON event carrying a **non-null usage object**.
 ///
-/// ⚠️ 这里不能简单判 `contains("\"usage\"")`：vLLM 流式响应的**第一个 chunk 就带
-/// `"usage":null`**，若把它当成 usage 事件扣住，会把首块压到流末尾才发出去，
-/// 等于破坏流式。所以必须要求冒号后面是 `{`（空对象 `{}` 也满足条件，触发合并后
-/// 会按需填充，属预期）。
+/// ⚠️ A plain `contains("\"usage\"")` check does not work here: the **first chunk of a
+/// vLLM streaming response already carries `"usage":null`**, and holding it back as if it
+/// were a usage event would delay the first chunk until the end of the stream, which
+/// breaks streaming. The colon must therefore be followed by `{` (an empty `{}` object
+/// qualifies as well; the merge fills it in as needed, which is expected).
 ///
-/// 匹配在每行上都会跑，但只做一次预编译规则匹配，不做完整 JSON 解析。
+/// The match runs on every line, but only as one pre-compiled regex match — no full JSON
+/// parsing.
 fn is_usage_event(payload: &str) -> bool {
     if payload == SSE_DONE {
         return false;
     }
     static RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-        // ⚠️ `\{` 后面**不能**加 `?`——那会让 `{` 变成可选，于是 `"usage": null`
-        // 也会命中，本函数就退化成 `contains("\"usage\"")`，注释里警告的坑会原地复活。
+        // ⚠️ `\{` must **not** be followed by `?` — that makes `{` optional, so
+        // `"usage": null` would match too, this function would degenerate into
+        // `contains("\"usage\"")`, and the trap warned about above would come back to
+        // life.
         regex::Regex::new(r#""usage"\s*:\s*\{"#).expect("valid usage pattern")
     });
     RE.is_match(payload)
 }
 
-/// 把 prefill 的 usage 合并进一个 SSE data 行。
+/// Merge prefill usage into one SSE data line.
 ///
-/// ⚠️ **必须原样保留行尾的所有换行符**（`\n`、`\n\n` 或 `\r\n`）。
+/// ⚠️ **Every trailing newline must be preserved verbatim** (`\n`, `\n\n` or `\r\n`).
 ///
-/// SSE 里一个事件以空行结束，所以 `data: {...}` 行的字节形如 `...}\n\n`——**两个** `\n`。
-/// 早期版本只保留了其中一个（`else if ends_with('\n') => "\n"`），于是：
-///   - 剩下的那个 `\n` 会被 `feed()` 当成独立空行切出来并立即透传；
-///   - 扣留的行落到流末尾时，判定「是否为最后一个事件」要看的 `\n\n` 边界就没了。
+/// In SSE an event ends with a blank line, so the bytes of a `data: {...}` line look like
+/// `...}\n\n` — **two** `\n`. An earlier version kept only one of them
+/// (`else if ends_with('\n') => "\n"`), which meant:
+///   - the remaining `\n` was cut out by `feed()` as a stand-alone blank line and passed
+///     through immediately;
+///   - once the held line reached the end of the stream, the `\n\n` boundary used to
+///     decide "is this the last event?" was gone.
 ///
-/// 症状是 `feed()` 在应当返回空的时候返回了 `b"\n"`。
+/// The symptom was `feed()` returning `b"\n"` when it should have returned nothing.
 ///
-/// 这里的做法：剥掉全部行尾换行符得到正文，再把**剥掉的那串原样接回**，
-/// 从而对 `\n` / `\n\n` / `\r\n` 都保持字节级不变。
+/// What this does: strip all trailing newlines to get the body, then append **the stripped
+/// sequence unchanged**, keeping the bytes identical for `\n` / `\n\n` / `\r\n`.
 ///
-/// 解析失败时返回 `None`，调用方应原样转发该行——**绝不因为合并失败而吞掉内容**。
+/// Returns `None` when parsing fails; the caller should forward the line verbatim —
+/// **never swallow content just because the merge failed**.
 fn merge_usage_into_sse_line(line: &str, prefill_json: &Value) -> Option<String> {
     let payload = sse_payload(line)?;
     let mut event: Value = serde_json::from_str(payload).ok()?;
@@ -131,20 +140,23 @@ fn merge_usage_into_sse_line(line: &str, prefill_json: &Value) -> Option<String>
     Some(format!("{SSE_DATA_PREFIX} {event}{trailing}"))
 }
 
-/// 增量式 SSE 流转换器：按行缓冲，把 prefill 的 usage 合并进携带 usage 的事件。
+/// Incremental SSE stream transformer: buffers line by line and merges prefill usage into
+/// the events that carry usage.
 ///
-/// # 为什么必须延迟一个事件
+/// # Why one event of delay is required
 ///
-/// vLLM 的 `stream_options.include_usage` 语义是「usage 在**最后一个** chunk 里」。
-/// 而 `merge_usage_in_json` 里有一条规则是「decode 没有 usage 时整体复制 prefill 的
-/// usage」——如果**逐行立即处理**，任何一个不带 usage 的中间 chunk（usage 为 null）
-/// 都会被这条规则填上 usage，等于凭空给每个 chunk 塞了 usage。
+/// vLLM's `stream_options.include_usage` semantics put usage in the **last** chunk. But
+/// `merge_usage_in_json` has a rule that copies prefill usage wholesale when decode has
+/// none — with **immediate line-by-line processing**, any intermediate chunk without usage
+/// (usage is null there) would be stamped with usage by that rule, inventing usage for
+/// every chunk out of thin air.
 ///
-/// 所以携带 usage 的行要**留到下一个 data 事件或 `[DONE]` 到来时**才输出，
-/// 以此确认「它就是最后一个」。中间 chunk 正常解析、不触发那条规则。
+/// A line carrying usage is therefore **held until the next data event or `[DONE]`
+/// arrives**, which confirms it really is the last one. Intermediate chunks are parsed
+/// normally and do not trigger that rule.
 ///
-/// 缓冲量有界：任何时刻最多只留一个 SSE 行（按 `\n` 切分，不会跨行累积）；
-/// 没有 usage 的流则只留一个被扣住的行。
+/// Buffering is bounded: at most one SSE line is held at any moment (splitting on `\n`
+/// never accumulates across lines); a stream without usage holds exactly one line.
 #[derive(Default)]
 pub struct SseUsageMerger {
     buf: Vec<u8>,
@@ -153,11 +165,13 @@ pub struct SseUsageMerger {
 }
 
 impl SseUsageMerger {
-    /// 处理一块字节，返回**可以立即下发**的字节。
+    /// Process one chunk of bytes and return the bytes that **may be sent on
+    /// immediately**.
     pub fn feed(&mut self, chunk: &[u8], prefill_json: &Value) -> Vec<u8> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        // 按 `\n` 切；最后一段没有换行符，留在 buf 里等下一块
+        // Split on `\n`; the last segment has no newline yet, so it stays in buf until the
+        // next chunk
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.buf.drain(..=pos).collect();
             self.handle_line(&line, prefill_json, &mut out);
@@ -165,7 +179,7 @@ impl SseUsageMerger {
         out
     }
 
-    /// 流结束：把还扣着的行放出去，并重建尾部行缓冲。
+    /// End of stream: release the held line and rebuild the trailing line buffer.
     pub fn finish(&mut self, prefill_json: &Value) -> Vec<u8> {
         let mut out = Vec::new();
         if !self.buf.is_empty() {
@@ -180,17 +194,19 @@ impl SseUsageMerger {
 
     fn handle_line(&mut self, line: &[u8], prefill_json: &Value, out: &mut Vec<u8>) {
         let Ok(text) = std::str::from_utf8(line) else {
-            // 非法 UTF-8：无法判定，原样透传
+            // Invalid UTF-8: cannot be decided, pass through verbatim
             out.extend_from_slice(line);
             return;
         };
 
-        // 正在扣留事件时，把紧随其后的空行也收进 held。
+        // While an event is held, take the blank line that follows it into held as well.
         //
-        // 空行是 SSE 事件的结束符，属于同一个事件单位，**不能单独下发**：
-        // `feed()` 是按 `\n` 逐行切的，所以 `data: {...}\n\n` 必然被切成
-        // 「数据行」+「单个 \n 的空行」两段。若让那个空行单独透传，字节顺序会变成
-        // 「空行 → held → [DONE]」，而 held 自己还带着第一个 `\n` —— 位置就错了。
+        // A blank line terminates an SSE event and belongs to the same event unit, so it
+        // **must not be sent on its own**: `feed()` splits line by line on `\n`, so
+        // `data: {...}\n\n` is always cut into a "data line" plus "a blank line holding a
+        // single \n". Sending that blank line through on its own would order the bytes as
+        // "blank line → held → [DONE]", while held itself still carries the first `\n` —
+        // the position would be wrong.
         if self.held.is_some() && text.trim().is_empty() {
             if let Some(held) = self.held.as_mut() {
                 held.extend_from_slice(line);
@@ -199,7 +215,8 @@ impl SseUsageMerger {
         }
 
         if sse_payload(text).is_some_and(is_usage_event) {
-            // 下一行仍是 data 事件 → 说明先前扣住的那行不是最后一个，先放出去
+            // The next line is still a data event → the previously held line was not the
+            // last one, so release it first
             if let Some(held) = self.held.take() {
                 out.extend_from_slice(&held);
             }
@@ -210,7 +227,8 @@ impl SseUsageMerger {
                     self.held = Some(merged.into_bytes());
                 }
                 None => {
-                    // 解析失败或无需改动：仍然扣住它，交给下一个事件判定是否为最后一个
+                    // Parse failure or nothing to change: keep holding it and let the next
+                    // event decide whether it is the last one
                     self.held = Some(line.to_vec());
                 }
             }
@@ -218,7 +236,7 @@ impl SseUsageMerger {
         }
 
         if text.trim() == "data: [DONE]" {
-            // 最后一个 data 事件已确认，释放扣住的行，再输出 [DONE]
+            // The last data event is confirmed: release the held line, then emit [DONE]
             if let Some(held) = self.held.take() {
                 out.extend_from_slice(&held);
             }
@@ -226,7 +244,7 @@ impl SseUsageMerger {
         out.extend_from_slice(line);
     }
 
-    /// 是否真正合并过（供调用方记日志/指标）。
+    /// Whether a merge actually happened (for caller logging/metrics).
     pub fn did_merge(&self) -> bool {
         self.merged
     }
@@ -754,13 +772,15 @@ mod tests {
         assert_eq!(decode_json["prompt_logprobs"], json!([null, -0.5, -1.2]));
     }
 
-    // ---------------------------------------------------------------- SSE 流式合并
+    // ---------------------------------------------------------------- SSE streaming merge
     //
-    // 这些用例覆盖的是「流式请求下 cached_tokens 不被 prefill 值纠正」这个缺陷的修复。
-    // 关键不变量：**中间 chunk 必须立即下发**，不能被扣到流末尾——否则流式就退化成
-    // 「攒完一整段再发」。vLLM 的首个 chunk 带 `"usage":null`，是最容易踩的坑。
+    // These cases cover the fix for "cached_tokens is not corrected by the prefill value on
+    // streaming requests". Key invariant: **intermediate chunks must be sent immediately**
+    // and must not be held back until the end of the stream — otherwise streaming
+    // degenerates into "buffer the whole response, then send". vLLM's first chunk carries
+    // `"usage":null`, which is the easiest trap to fall into.
 
-    /// 组装 prefill 侧响应（含 cached_tokens）。
+    /// Build a prefill-side response (with cached_tokens).
     fn prefill_with_cached(cached: i64) -> Value {
         json!({
             "usage": {
@@ -772,7 +792,8 @@ mod tests {
         })
     }
 
-    /// 把整条流的字节按 `\n` 切成事件文本，便于断言顺序。
+    /// Split the bytes of a whole stream into event texts on `\n`, so the order can be
+    /// asserted.
     fn sse_lines(bytes: &[u8]) -> Vec<String> {
         String::from_utf8_lossy(bytes)
             .split('\n')
@@ -802,20 +823,30 @@ mod tests {
         let out = feed_all(&mut merger, stream.as_bytes(), &prefill);
         let lines = sse_lines(&out);
 
-        assert!(merger.did_merge(), "应当发生合并");
+        assert!(merger.did_merge(), "a merge should have happened");
         assert_eq!(lines.len(), 4);
         assert!(lines[0].contains("\"Hel\""));
         assert!(lines[1].contains("\"lo\""));
-        assert!(lines[2].contains("\"cached_tokens\":50"), "末块应被改写: {}", lines[2]);
-        assert!(!lines[2].contains("\"cached_tokens\":-1"), "占位值应被替换");
+        assert!(
+            lines[2].contains("\"cached_tokens\":50"),
+            "the last chunk should be rewritten: {}",
+            lines[2]
+        );
+        assert!(
+            !lines[2].contains("\"cached_tokens\":-1"),
+            "the placeholder should be replaced"
+        );
         assert_eq!(lines[3], "data: [DONE]");
     }
 
-    /// **最重要的一条**：首块的 `"usage":null` 不能触发扣留，否则流式失效。
+    /// **The most important one**: the first chunk's `"usage":null` must not trigger
+    /// holding, otherwise streaming breaks.
     ///
-    /// ⚠️ 这里必须检查**是否立即下发**，不能只检查"内容最终在不在输出里"。
-    /// 因为即使首块被错误扣住，`[DONE]` 到来时也会把它放出去，内容照样出现——
-    /// 只查内容的断言会**假通过**，测不出"首块被压到流末尾"这个退化。
+    /// ⚠️ This has to check **whether the chunk is sent immediately**, not merely that "the
+    /// content shows up in the output eventually". Even if the first chunk were wrongly
+    /// held, it would be released when `[DONE]` arrives and the content would still appear
+    /// — a content-only assertion would **pass falsely** and would not catch the "first
+    /// chunk pushed to the end of the stream" regression.
     #[test]
     fn test_sse_merger_does_not_hold_null_usage_chunk() {
         let prefill = prefill_with_cached(50);
@@ -826,31 +857,38 @@ mod tests {
 
         assert!(
             String::from_utf8_lossy(&out).contains("\"A\""),
-            "带 \"usage\":null 的首块必须立即下发，不能被扣住"
+            "a first chunk carrying \"usage\":null must be sent immediately, not held"
         );
-        // 整个首块（含尾部空行）都应被消费掉，不为后续输出留残留
+        // The whole first chunk (including its trailing blank line) should be consumed,
+        // leaving no residue for later output
         assert_eq!(
-            out, first.as_bytes(),
-            "首块应逐字节原样立即下发，实际: {:?}",
+            out,
+            first.as_bytes(),
+            "the first chunk should be sent immediately byte for byte, got: {:?}",
             String::from_utf8_lossy(&out)
         );
 
-        // 后续再喂一个真实 usage 行：若首块曾被误扣，这里会冒出来
+        // Feed a real usage line afterwards: if the first chunk had been held by mistake,
+        // it would surface here
         let tail = "data: {\"choices\":[],\"usage\":{\"prompt_tokens_details\":\
                     {\"cached_tokens\":-1}}}\n\ndata: [DONE]\n\n";
         let rest = feed_all(&mut merger, tail.as_bytes(), &prefill);
         let text = String::from_utf8_lossy(&rest);
 
-        assert!(!text.contains("\"A\""), "首块不应被推迟到这里: {text:?}");
+        assert!(
+            !text.contains("\"A\""),
+            "the first chunk must not be deferred to here: {text:?}"
+        );
         assert_eq!(
             text.matches("data: ").count(),
             2,
-            "只应有两个 data 事件（usage 行 + DONE）: {text:?}"
+            "there should be exactly two data events (the usage line + DONE): {text:?}"
         );
         assert!(merger.did_merge());
     }
 
-    /// 字节流可能在任意位置断开，必须跨 chunk 正确拼行。
+    /// The byte stream can split at any position; lines must be reassembled correctly
+    /// across chunks.
     #[test]
     fn test_sse_merger_handles_chunk_boundary_split() {
         let prefill = prefill_with_cached(50);
@@ -870,7 +908,7 @@ mod tests {
         assert_eq!(lines[1], "data: [DONE]");
     }
 
-    /// 逐字节喂入，考验状态机的健壮性。
+    /// Feed one byte at a time, stressing the state machine.
     #[test]
     fn test_sse_merger_byte_by_byte() {
         let prefill = prefill_with_cached(50);
@@ -895,7 +933,7 @@ mod tests {
         assert_eq!(lines[2], "data: [DONE]");
     }
 
-    /// 没有 usage 的流：内容一字不改，也不产生任何 usage。
+    /// Stream without usage: nothing is altered and no usage is produced.
     #[test]
     fn test_sse_merger_passthrough_without_usage() {
         let prefill = prefill_with_cached(50);
@@ -908,10 +946,14 @@ mod tests {
         let out = feed_all(&mut merger, stream.as_bytes(), &prefill);
 
         assert!(!merger.did_merge());
-        assert_eq!(out, stream.as_bytes(), "无 usage 时必须原样透传");
+        assert_eq!(
+            out,
+            stream.as_bytes(),
+            "without usage the stream must pass through verbatim"
+        );
     }
 
-    /// prefill 没给 usage：不该据 prefill 改动任何东西。
+    /// Prefill provides no usage: nothing may be changed based on prefill.
     #[test]
     fn test_sse_merger_noop_without_prefill_usage() {
         let prefill = json!({"choices": []});
@@ -927,11 +969,12 @@ mod tests {
         assert!(!merger.did_merge());
         assert!(
             String::from_utf8_lossy(&out).contains("\"cached_tokens\":-1"),
-            "prefill 无 usage 时不得改动 decode 的值"
+            "decode's value must not be changed when prefill has no usage"
         );
     }
 
-    /// decode 给出合法值时保留（与非流式路径的「合法值优先」一致）。
+    /// A valid value reported by decode is kept (consistent with "valid value wins" on the
+    /// non-streaming path).
     #[test]
     fn test_sse_merger_keeps_valid_decode_value() {
         let prefill = prefill_with_cached(50);
@@ -944,11 +987,11 @@ mod tests {
         let mut merger = SseUsageMerger::default();
         let out = feed_all(&mut merger, stream.as_bytes(), &prefill);
 
-        assert!(!merger.did_merge(), "合法值不应被覆盖");
+        assert!(!merger.did_merge(), "a valid value must not be overwritten");
         assert!(String::from_utf8_lossy(&out).contains("\"cached_tokens\":12"));
     }
 
-    /// 流中断、没等到 `[DONE]`：扣住的行不能丢。
+    /// Stream truncated without waiting for `[DONE]`: the held line must not be lost.
     #[test]
     fn test_sse_merger_flushes_held_line_when_stream_truncated() {
         let prefill = prefill_with_cached(50);
@@ -957,21 +1000,29 @@ mod tests {
         let stream = "data: {\"choices\":[],\"usage\":{\"prompt_tokens_details\":\
                       {\"cached_tokens\":-1}}}\n\n";
         let out = merger.feed(stream.as_bytes(), &prefill);
-        assert!(out.is_empty(), "usage 行应被扣住等待确认是否为最后一个");
+        assert!(
+            out.is_empty(),
+            "the usage line should be held until it is confirmed to be last"
+        );
 
         let tail = merger.finish(&prefill);
         let lines = sse_lines(&tail);
-        assert_eq!(lines.len(), 1, "流结束时扣住的行必须补发，否则丢数据");
+        assert_eq!(
+            lines.len(),
+            1,
+            "the held line must be flushed at end of stream, otherwise data is lost"
+        );
         assert!(lines[0].contains("\"cached_tokens\":50"));
     }
 
-    /// 尾部残留没有换行的完整 data 行：也要处理，不能当垃圾丢掉。
+    /// A complete trailing data line with no newline: it must be handled too, rather than
+    /// dropped as garbage.
     #[test]
     fn test_sse_merger_handles_unterminated_trailing_line() {
         let prefill = prefill_with_cached(50);
         let mut merger = SseUsageMerger::default();
 
-        // 注意结尾没有 `\n`
+        // Note there is no trailing `\n`
         let stream = "data: {\"choices\":[],\"usage\":{\"prompt_tokens_details\":\
                       {\"cached_tokens\":-1}}}";
         let out = feed_all(&mut merger, stream.as_bytes(), &prefill);
@@ -981,10 +1032,11 @@ mod tests {
         assert!(lines[0].contains("\"cached_tokens\":50"), "{}", lines[0]);
     }
 
-    /// 回归：被改写的行必须保留行尾换行，否则会与 `data: [DONE]` 粘成一行。
+    /// Regression: a rewritten line must keep its line terminator, otherwise it fuses with
+    /// `data: [DONE]` into a single line.
     ///
-    /// 这里断言**原始字节**而不是切分后的行——因为粘行的症状正是「只剩一行」，
-    /// 按行断言恰好会漏掉它。
+    /// This asserts the **raw bytes** rather than the split lines — fusing shows up exactly
+    /// as "only one line remains", which a per-line assertion would miss.
     #[test]
     fn test_sse_merger_preserves_line_terminator_after_merge() {
         let prefill = prefill_with_cached(50);
@@ -998,15 +1050,18 @@ mod tests {
         let out = feed_all(&mut merger, stream.as_bytes(), &prefill);
 
         assert!(merger.did_merge());
-        // 断言完整字节序列，而不是手写 needle。
+        // Assert the complete byte sequence instead of a hand-written needle.
         //
-        // 教训：这条用例手写 needle 时错过两次（先少一个 `}`；改成"补一个 `}`"后**仍不够**——
-        // `cached_tokens` 后面实际有 **三个** `}`，依次关掉 cached_tokens 对象、
-        // prompt_tokens_details 对象、usage 对象）。手写 needle 极易错，一旦错就恒为假、
-        // 一直红着，反而掩盖实现是否真的正确。整串比对让实现自身定义"正确输出"。
+        // Lesson: a hand-written needle got this wrong twice for this case (first one `}`
+        // too few; then "add one `}`" was **still not enough** — after `cached_tokens`
+        // there are actually **three** `}` closing the cached_tokens object, the
+        // prompt_tokens_details object and the usage object in turn). Hand-written needles
+        // are extremely error-prone, and a wrong one is constantly false, staying red and
+        // hiding whether the implementation is actually correct. Comparing the whole
+        // string lets the implementation define "correct output" itself.
         //
-        // 注意 Rust 里相邻字节字面量**不会**自动拼接（那是 C 的行为，这里会变成元组），
-        // 必须用 `concat!`。
+        // Note that adjacent byte literals in Rust are **not** concatenated automatically
+        // (that is C behaviour; here it would produce a tuple) — `concat!` is required.
         let expected = concat!(
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens_details\":",
             "{\"cached_tokens\":50}}}\n\ndata: [DONE]\n\n"
@@ -1014,13 +1069,13 @@ mod tests {
         assert_eq!(
             out.as_slice(),
             expected.as_bytes(),
-            "\n  期望: {:?}\n  实际: {:?}",
+            "\n  expected: {:?}\n  actual:   {:?}",
             expected,
             String::from_utf8_lossy(&out)
         );
     }
 
-    /// 同上，但覆盖 CRLF 行尾。
+    /// Same as above, but covering CRLF line endings.
     #[test]
     fn test_sse_merger_preserves_crlf_terminator() {
         let prefill = prefill_with_cached(50);
@@ -1031,7 +1086,7 @@ mod tests {
         let out = feed_all(&mut merger, stream.as_bytes(), &prefill);
 
         assert!(merger.did_merge());
-        // 同样整串比对；相邻字面量须用 concat!
+        // Whole-string comparison again; adjacent literals need concat!
         let expected = concat!(
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens_details\":",
             "{\"cached_tokens\":50}}}\r\ndata: [DONE]\r\n"
@@ -1039,28 +1094,37 @@ mod tests {
         assert_eq!(
             out.as_slice(),
             expected.as_bytes(),
-            "\n  期望: {:?}\n  实际: {:?}",
+            "\n  expected: {:?}\n  actual:   {:?}",
             expected,
             String::from_utf8_lossy(&out)
         );
     }
 
-    /// 流中断且扣住的行尚未放出的**最坏情形**：截断点正好在 usage 行之后、
-    /// 空行之前。此时 held 只含数据行、finish 必须把它补发。
+    /// **Worst case** of a truncated stream whose held line has not been released yet: the
+    /// cut lands right after the usage line and before the blank line. Here held contains
+    /// only the data line, and finish must flush it.
     ///
-    /// 与 `flushes_held_line_when_stream_truncated` 的区别：那条的截断点在空行之后。
+    /// Differs from `flushes_held_line_when_stream_truncated`, where the cut lands after
+    /// the blank line.
     #[test]
     fn test_sse_merger_flushes_on_truncation_before_blank_line() {
         let prefill = prefill_with_cached(50);
         let mut merger = SseUsageMerger::default();
 
-        // 只喂数据行本身，不带结尾的空行
+        // Feed only the data line itself, without its trailing blank line
         let stream = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":-1}}}\n";
         let out = merger.feed(stream, &prefill);
-        assert!(out.is_empty(), "应被扣住，实际: {:?}", String::from_utf8_lossy(&out));
+        assert!(
+            out.is_empty(),
+            "should be held, got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
 
         let tail = merger.finish(&prefill);
         let text = String::from_utf8_lossy(&tail);
-        assert!(text.contains("\"cached_tokens\":50"), "扣住的行必须补发: {text:?}");
+        assert!(
+            text.contains("\"cached_tokens\":50"),
+            "the held line must be flushed: {text:?}"
+        );
     }
 }

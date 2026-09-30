@@ -716,8 +716,9 @@ impl VllmPDRouter {
             // The transform is line-oriented and deliberately holds back at most one SSE
             // line, so bytes still flow through incrementally; see SseUsageMerger.
             let prefill_for_stream: Option<Value> = prefill_response_json.cloned();
-            // 用 info! 而非 debug!：这条决定"合不合并"，是排查流式 cached_tokens 的
-            // 第一现场，默认 INFO 级别必须可见。
+            // Use info! rather than debug!: this line decides whether merging happens at
+            // all and is the first place to look when debugging streaming cached_tokens,
+            // so it must be visible at the default INFO level.
             info!(
                 "Streaming PD response: usage merge {} (prefill usage={:?})",
                 if prefill_for_stream.is_some() {
@@ -733,9 +734,11 @@ impl VllmPDRouter {
             let merger = logprobs_merge::SseUsageMerger::default();
             let decode_stream = decode_response.bytes_stream();
 
-            // 用 futures::stream::unfold 做增量转换（不引入 async-stream 新依赖）。
-            // 状态里带一个 `done` 标志：主循环结束后再跑一次，把 SseUsageMerger 扣住的
-            // 最后一行放出去（流异常中断、没等到 [DONE] 时也要放，否则那行会丢）。
+            // Use futures::stream::unfold for the incremental transform (no new
+            // async-stream dependency). The state carries a `done` flag: after the main
+            // loop ends, run once more to release the last line held by SseUsageMerger (a
+            // stream that breaks without `[DONE]` must flush it too, otherwise that line
+            // is lost).
             let merged_stream = futures::stream::unfold(
                 (decode_stream, merger, prefill_for_stream, false),
                 |(mut stream, mut merger, prefill, mut done)| async move {
@@ -770,8 +773,10 @@ impl VllmPDRouter {
                                     Some(prefill) => merger.finish(prefill),
                                     None => Vec::new(),
                                 };
-                                // 结果日志用 info!：这是"到底合并了没有"的结论，
-                                // debug! 在默认级别下看不见，会让排查无从下手。
+                                // Use info! for the result log: this is the conclusion of
+                                // "did merging happen at all", and debug! is invisible at
+                                // the default level, which would leave nothing to debug
+                                // with.
                                 info!(
                                     "Streaming PD response finished: merged={}, tail_bytes={}",
                                     merger.did_merge(),
@@ -1666,10 +1671,11 @@ impl VllmPDRouter {
         // Streaming responses need usage normalization, same as the non-streaming
         // branch above.
         //
-        // ⚠️ 这里是**第二个**流式透传点：`route_chat` 的 direct URL 模式走
-        // `process_vllm_two_stage_request`（本函数），而不是 `handle_decode_response`。
-        // 两处都要接 SseUsageMerger，只改一处会漏（实测踩过：单元测试全绿，
-        // 但端到端仍返回 -1）。
+        // ⚠️ This is the **second** streaming pass-through: the direct URL mode of
+        // `route_chat` goes through `process_vllm_two_stage_request` (this function)
+        // rather than `handle_decode_response`. Both places need SseUsageMerger; patching
+        // only one of them misses it (observed in practice: unit tests all green, yet end
+        // to end still returned -1).
         debug!(
             "Streaming PD response (two-stage): merging usage (needs_logprobs={})",
             needs_logprobs
