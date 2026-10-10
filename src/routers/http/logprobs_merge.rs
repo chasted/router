@@ -6,6 +6,37 @@
 use serde_json::Value;
 use tracing::{debug, info};
 
+/// Locate the object that holds the usage inside a **decode** payload, creating the slot (as
+/// `null`) when it is absent so the caller can fill it in. `None` means the payload cannot
+/// carry usage at all.
+///
+/// Two API surfaces share this module and they disagree on where usage lives:
+///
+/// - **Chat Completions / Completions** carry it at the top level: `{"usage": {...}}`.
+/// - A **Responses API streaming event** wraps a whole response, so it sits one level down:
+///   `{"type": "response.completed", "response": {..., "usage": {...}}}`. `/v1/responses` is
+///   routed through `route_transparent` → `process_vllm_two_stage_request`, i.e. through the
+///   very same [`SseUsageMerger`], so it reaches this module too.
+///
+/// ⚠️ The nesting must be detected **before** falling back to the top level: a Responses
+/// event has no top-level `usage`, so the fallback would happily fabricate one — adding
+/// prefill's whole usage at a level no client reads while leaving the real
+/// `response.usage.input_tokens_details.cached_tokens` at the decode-side placeholder.
+///
+/// The top level still wins whenever it already holds a usage **object**, so payloads of
+/// the existing surfaces keep their behaviour exactly.
+fn usage_slot_mut(decode_json: &mut Value) -> Option<&mut Value> {
+    let nested_usage = !decode_json.get("usage").is_some_and(Value::is_object)
+        && decode_json.get("response").is_some_and(Value::is_object);
+
+    let decode_obj = decode_json.as_object_mut()?;
+    if nested_usage {
+        let response = decode_obj.get_mut("response")?.as_object_mut()?;
+        return Some(response.entry("usage".to_string()).or_insert(Value::Null));
+    }
+    Some(decode_obj.entry("usage".to_string()).or_insert(Value::Null))
+}
+
 /// Merge usage metadata from prefill response into decode response.
 ///
 /// Prefer the prefill-side cached_tokens, because vLLM decode-side cached token
@@ -28,24 +59,23 @@ pub fn merge_usage_in_json(prefill_json: &Value, decode_json: &mut Value) -> boo
         return false;
     };
 
+    // Which key holds the usage depends on the API surface — see `usage_slot_mut`.
+    let Some(usage_slot) = usage_slot_mut(decode_json) else {
+        return false;
+    };
+
     // ⚠️ "Missing" is not the only unusable shape: engines legitimately emit
     // `"usage": null` (and `"prompt_tokens_details": null`, see below). Both mean "no
     // decode-side accounting here", so prefill's usage is filled in — an early `return
     // false` on a `null` would leave the client with the unusable value it already had,
     // which is precisely the bug this function exists to fix.
-    if !decode_json.get("usage").is_some_and(Value::is_object) {
-        let Some(decode_obj) = decode_json.as_object_mut() else {
-            return false;
-        };
-        decode_obj.insert("usage".to_string(), prefill_usage.clone());
+    if !usage_slot.is_object() {
+        *usage_slot = prefill_usage.clone();
         debug!("[USAGE MERGE] Filled in decode usage from prefill (missing or null)");
         return true;
     }
 
-    let Some(decode_usage_obj) = decode_json
-        .get_mut("usage")
-        .and_then(|v| v.as_object_mut())
-    else {
+    let Some(decode_usage_obj) = usage_slot.as_object_mut() else {
         return false;
     };
 
@@ -990,6 +1020,110 @@ mod tests {
             decode_json["usage"]["prompt_tokens_details"]["cached_tokens"],
             json!(50)
         );
+    }
+
+    /// A **Responses API streaming event** carries the usage one level down, under
+    /// `response`:
+    ///
+    /// ```text
+    /// {"type":"response.completed","response":{...,"usage":{"input_tokens_details":{...}}}}
+    /// ```
+    ///
+    /// `/v1/responses` goes through the same transformer (`route_transparent` →
+    /// `process_vllm_two_stage_request`), so writing prefill's usage at the event's **top
+    /// level** both invents a field no client reads and leaves the real
+    /// `response.usage.input_tokens_details.cached_tokens` at the decode-side placeholder.
+    #[test]
+    fn test_merge_usage_repairs_responses_api_event_nested_usage() {
+        let prefill_json = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 1,
+                "total_tokens": 101,
+                "input_tokens_details": { "cached_tokens": 50 }
+            }
+        });
+
+        let mut decode_json = json!({
+            "type": "response.completed",
+            "sequence_number": 3,
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "total_tokens": 110,
+                    "input_tokens_details": { "cached_tokens": -1 }
+                }
+            }
+        });
+
+        let merged = merge_usage_in_json(&prefill_json, &mut decode_json);
+        assert!(merged);
+        assert_eq!(
+            decode_json["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            json!(50),
+            "the nested usage must be the one repaired"
+        );
+        assert_eq!(
+            decode_json["response"]["usage"]["output_tokens"],
+            json!(10),
+            "decode's own counters must survive"
+        );
+        assert!(
+            decode_json.get("usage").is_none(),
+            "no top-level usage may be added to a Responses event: {decode_json}"
+        );
+    }
+
+    /// The same shape, end to end through the SSE merger: a Responses stream of deltas plus
+    /// a final `response.completed`.
+    #[test]
+    fn test_sse_merger_merges_responses_api_stream() {
+        let prefill = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 1,
+                "total_tokens": 101,
+                "input_tokens_details": { "cached_tokens": 50 }
+            }
+        });
+        let stream = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,",
+            "\"delta\":\"Hel\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,",
+            "\"delta\":\"lo\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{",
+            "\"id\":\"resp_1\",\"usage\":{\"input_tokens\":100,\"output_tokens\":2,",
+            "\"total_tokens\":102,\"input_tokens_details\":{\"cached_tokens\":-1}}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let mut merger = SseUsageMerger::default();
+        let out = feed_all(&mut merger, stream.as_bytes(), &prefill);
+        let events = sse_events(&out);
+
+        assert!(merger.did_merge());
+        assert_eq!(events.len(), 4, "3 data events + [DONE]");
+
+        // Deltas are untouched and still flow through
+        let first_delta = sse_payload_json(&events[0]);
+        assert_eq!(first_delta["type"], json!("response.output_text.delta"));
+        assert_eq!(first_delta["delta"], json!("Hel"));
+
+        let completed = sse_payload_json(&events[2]);
+        assert_eq!(completed["type"], json!("response.completed"));
+        assert_eq!(
+            completed["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            json!(50),
+            "the client reads usage from response.usage, so that is where 50 must land"
+        );
+        assert!(
+            completed.get("usage").is_none(),
+            "no top-level usage may be added to a Responses event: {completed}"
+        );
+        assert_eq!(events[3], "data: [DONE]");
     }
 
     #[test]
