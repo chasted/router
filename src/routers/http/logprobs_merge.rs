@@ -294,7 +294,7 @@ impl SseUsageMerger {
         // Every other line — another data event (`data: [DONE]`, an error frame, ...), an
         // SSE comment, an `event:` field, even a second blank line — comes **after** the
         // held one, so the held event is released first. See the type-level docs: skipping
-        // this step fuses two JSON payloads into a single unparseable SSE event.
+        // this step fuses two JSON payloads into a single unparsable SSE event.
         self.release_held(out);
 
         if sse_payload(text).is_some_and(is_usage_event) {
@@ -1625,7 +1625,7 @@ mod tests {
     /// A usage-carrying content chunk followed by an error frame **without** usage: the
     /// held content chunk must be released first, so the two payloads end up in two
     /// separate events (the old code emitted the error line while the content line was
-    /// still held, gluing both into one unparseable event).
+    /// still held, gluing both into one unparsable event).
     #[test]
     fn test_sse_merger_releases_held_line_before_error_event() {
         let prefill = prefill_with_cached(50);
