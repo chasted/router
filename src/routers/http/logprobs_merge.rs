@@ -6,9 +6,9 @@
 use serde_json::Value;
 use tracing::{debug, info};
 
-/// Locate the object that holds the usage inside a **decode** payload, creating the slot (as
-/// `null`) when it is absent so the caller can fill it in. `None` means the payload cannot
-/// carry usage at all.
+/// Locate the **existing** usage slot inside a decode payload. `None` means the payload
+/// carries no usage at all, and in that case nothing may be added — see
+/// [`merge_usage_in_json`].
 ///
 /// Two API surfaces share this module and they disagree on where usage lives:
 ///
@@ -23,24 +23,46 @@ use tracing::{debug, info};
 /// prefill's whole usage at a level no client reads while leaving the real
 /// `response.usage.input_tokens_details.cached_tokens` at the decode-side placeholder.
 ///
-/// The top level still wins whenever it already holds a usage **object**, so payloads of
-/// the existing surfaces keep their behaviour exactly.
+/// The top level still wins whenever the key is present, so payloads of the existing surfaces
+/// keep their behaviour exactly.
 fn usage_slot_mut(decode_json: &mut Value) -> Option<&mut Value> {
-    let nested_usage = !decode_json.get("usage").is_some_and(Value::is_object)
-        && decode_json.get("response").is_some_and(Value::is_object);
-
-    let decode_obj = decode_json.as_object_mut()?;
-    if nested_usage {
-        let response = decode_obj.get_mut("response")?.as_object_mut()?;
-        return Some(response.entry("usage".to_string()).or_insert(Value::Null));
+    // Chat Completions / Completions: the top-level `usage` key, whether it holds an object
+    // or a placeholder such as `null`.
+    if decode_json.get("usage").is_some() {
+        return decode_json.get_mut("usage");
     }
-    Some(decode_obj.entry("usage".to_string()).or_insert(Value::Null))
+
+    // Responses API event: usage lives one level down. `response` must be a JSON **object** —
+    // the non-streaming Responses body carries `"object": "response"` as a *string* and has no
+    // `response` key at all, so it correctly falls through to `None` here.
+    if decode_json.get("response").is_some_and(Value::is_object) {
+        return decode_json.get_mut("response")?.get_mut("usage");
+    }
+
+    None
 }
 
 /// Merge usage metadata from prefill response into decode response.
 ///
 /// Prefer the prefill-side cached_tokens, because vLLM decode-side cached token
 /// accounting may temporarily report invalid placeholder values such as -1.
+///
+/// # Only the cached-token accounting is ever taken from prefill
+///
+/// The two stages own different halves of a usage object:
+///
+/// - **prefill** owns `cached_tokens` (its prefix-cache lookup is what produces it);
+/// - **decode** owns the output counts — `completion_tokens` / `output_tokens`, and therefore
+///   `total_tokens` as well.
+///
+/// ⚠️ The prefill stage is forced to a single output token
+/// (`VllmPDRouter::prepare_prefill_request`), so its output/total counts are an artifact of
+/// that rewrite rather than a property of the answer: copying them reported a 500-token answer
+/// as `completion_tokens: 1` / `total_tokens: prompt + 1`.
+///
+/// So when decode reports **no** usage (key missing, or `null`), this function leaves the
+/// payload untouched: unknown counts stay unknown. Only a usage object decode actually
+/// reported gets its `cached_tokens` repaired.
 pub fn merge_usage_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
     let Some(prefill_usage) = prefill_json.get("usage") else {
         return false;
@@ -61,18 +83,24 @@ pub fn merge_usage_in_json(prefill_json: &Value, decode_json: &mut Value) -> boo
 
     // Which key holds the usage depends on the API surface — see `usage_slot_mut`.
     let Some(usage_slot) = usage_slot_mut(decode_json) else {
+        debug!(
+            "[USAGE MERGE] decode payload carries no usage; leaving it untouched instead of \
+             fabricating one from prefill"
+        );
         return false;
     };
 
-    // ⚠️ "Missing" is not the only unusable shape: engines legitimately emit
-    // `"usage": null` (and `"prompt_tokens_details": null`, see below). Both mean "no
-    // decode-side accounting here", so prefill's usage is filled in — an early `return
-    // false` on a `null` would leave the client with the unusable value it already had,
-    // which is precisely the bug this function exists to fix.
+    // ⚠️ `null` (or any other non-object) means "decode reported nothing", which is **not** the
+    // same as "an empty usage object waiting to be filled in": there are no decode counts to
+    // keep and no place to put prefill's `cached_tokens` without also importing prefill's
+    // one-token output counts. Leave it as-is. (The details-level `null` handled further down
+    // is different — that one lives *inside* a usage object decode did report.)
     if !usage_slot.is_object() {
-        *usage_slot = prefill_usage.clone();
-        debug!("[USAGE MERGE] Filled in decode usage from prefill (missing or null)");
-        return true;
+        debug!(
+            "[USAGE MERGE] decode usage is not an object (null/placeholder); leaving it as-is — \
+             prefill's counts are one-token artifacts"
+        );
+        return false;
     }
 
     let Some(decode_usage_obj) = usage_slot.as_object_mut() else {
@@ -195,17 +223,19 @@ fn merge_usage_into_sse_line(line: &str, prefill_json: &Value) -> Option<String>
 /// Incremental SSE stream transformer: buffers line by line and merges prefill usage into
 /// the events that carry usage.
 ///
-/// # Why one event of delay is required
+/// # Why one event of delay is kept
 ///
-/// vLLM's `stream_options.include_usage` semantics put usage in the **last** chunk. But
-/// `merge_usage_in_json` has a rule that copies prefill usage wholesale when decode has
-/// none — with **immediate line-by-line processing**, any intermediate chunk without usage
-/// (usage is null there) would be stamped with usage by that rule, inventing usage for
-/// every chunk out of thin air.
+/// vLLM's `stream_options.include_usage` semantics put usage in the **last** chunk, and the
+/// merger keeps the rewritten line back until the next line arrives so that everything the
+/// rewrite touches is still in order when it goes out.
 ///
-/// A line carrying usage is therefore **held until the next line arrives**, which confirms
-/// whether it really was the last one. Intermediate chunks are parsed normally and do not
-/// trigger that rule.
+/// ⚠️ This delay is **not** what protects intermediate chunks: those are protected by
+/// `is_usage_event`, which only matches chunks that actually carry a usage **object** (the
+/// first chunk of a vLLM stream has `"usage": null` and is passed through untouched). The
+/// earlier rationale for the delay — "a chunk without usage would be stamped with prefill's
+/// usage by the merge rule" — no longer applies, because `merge_usage_in_json` never invents
+/// a usage object any more: it only repairs `cached_tokens` inside a usage object decode
+/// already reported.
 ///
 /// # Byte order and event boundaries are part of the contract
 ///
@@ -996,29 +1026,34 @@ mod tests {
         );
     }
 
-    /// A `usage` that is present but `null` is the same class of shape problem one level
-    /// up: prefill's usage is copied in rather than leaving the client with `null`.
+    /// Decode reports `"usage": null`: that means "no accounting", not "an empty usage to be
+    /// filled in from prefill".
+    ///
+    /// ⚠️ Filling it in used to copy prefill's **whole** usage object, including the
+    /// `completion_tokens: 1` that prefill is forced to produce — reporting a long answer as
+    /// one token. Unknown counts must stay unknown.
     #[test]
-    fn test_merge_usage_fills_null_usage() {
+    fn test_merge_usage_leaves_null_usage_untouched() {
         let prefill_json = json!({
             "usage": {
                 "prompt_tokens": 100,
-                "completion_tokens": 1,
+                "completion_tokens": 1,          // prefill's forced one-token artifact
                 "total_tokens": 101,
                 "prompt_tokens_details": { "cached_tokens": 50 }
             }
         });
 
         let mut decode_json = json!({
-            "choices": [{ "message": { "content": "ok" } }],
+            "choices": [{ "message": { "content": "a much longer answer than one token" } }],
             "usage": null
         });
 
         let merged = merge_usage_in_json(&prefill_json, &mut decode_json);
-        assert!(merged);
-        assert_eq!(
-            decode_json["usage"]["prompt_tokens_details"]["cached_tokens"],
-            json!(50)
+        assert!(!merged, "there is no usage object to repair");
+        assert_eq!(decode_json["usage"], json!(null), "null must stay null");
+        assert!(
+            decode_json["usage"].get("completion_tokens").is_none(),
+            "prefill's one-token count must not appear: {decode_json}"
         );
     }
 
@@ -1158,12 +1193,18 @@ mod tests {
         );
     }
 
+    /// Decode omits `usage` entirely: nothing may be invented for it.
+    ///
+    /// ⚠️ Regression guard for the usage-accounting bug: prefill runs with `max_tokens = 1`
+    /// (`prepare_prefill_request`), so borrowing its usage reported a long answer as
+    /// `completion_tokens: 1` / `total_tokens: prompt + 1`. Decode's counts are unknown here
+    /// and must stay unknown — the response is forwarded exactly as decode sent it.
     #[test]
-    fn test_merge_usage_copies_usage_when_decode_missing() {
+    fn test_merge_usage_does_not_borrow_prefill_counts_when_decode_has_no_usage() {
         let prefill_json = json!({
             "usage": {
                 "prompt_tokens": 100,
-                "completion_tokens": 1,
+                "completion_tokens": 1,          // prefill's forced one-token artifact
                 "total_tokens": 101,
                 "prompt_tokens_details": {
                     "cached_tokens": 50
@@ -1172,14 +1213,19 @@ mod tests {
         });
 
         let mut decode_json = json!({
-            "choices": [{ "message": { "content": "ok" } }]
+            "choices": [{ "message": { "content": "a much longer answer than one token" } }]
         });
 
         let merged = merge_usage_in_json(&prefill_json, &mut decode_json);
-        assert!(merged);
-        assert_eq!(
-            decode_json["usage"]["prompt_tokens_details"]["cached_tokens"],
-            json!(50)
+        assert!(!merged, "there is no usage object to repair");
+        assert!(
+            decode_json.get("usage").is_none(),
+            "no usage object may be fabricated from prefill: {decode_json}"
+        );
+        assert!(
+            decode_json.get("completion_tokens").is_none()
+                && decode_json.get("total_tokens").is_none(),
+            "prefill's one-token counts must not leak into the response: {decode_json}"
         );
     }
 
