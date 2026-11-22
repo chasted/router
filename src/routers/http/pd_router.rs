@@ -148,7 +148,7 @@ pub(super) fn select_pd_pair(
         PendingStageSelection {
             decision: provisional_decode(loads, &decode_endpoints, &decode_indices)?,
             cache_commit: None,
-            shadow: None,
+            pressure_observation: None,
         }
     };
 
@@ -228,11 +228,12 @@ pub(super) fn model_eligible(worker: &dyn Worker, model_id: Option<&str>) -> boo
 struct PendingStageSelection<'a> {
     decision: StageDecision,
     cache_commit: Option<(&'a CacheAwarePolicy, PreparedCacheDecision<'static>)>,
-    shadow: Option<PressureObservation>,
+    pressure_observation: Option<PressureObservation>,
 }
 
 struct PressureObservation {
     stage: &'static str,
+    mode: PressureMode,
     reason: &'static str,
     baseline_worker: String,
     proposed_worker: Option<String>,
@@ -243,16 +244,21 @@ impl PressureObservation {
         metrics::counter!(
             "vllm_router_pd_pressure_decisions_total",
             "stage" => self.stage,
-            "mode" => "shadow",
+            "mode" => self.mode.as_str(),
             "reason" => self.reason,
         )
         .increment(1);
+        if self.mode == PressureMode::On && self.reason == "override" {
+            metrics::counter!("vllm_router_pd_pressure_overrides_total", "stage" => self.stage)
+                .increment(1);
+        }
         debug!(
             stage = self.stage,
+            mode = self.mode.as_str(),
             reason = self.reason,
             baseline = self.baseline_worker,
             proposed = self.proposed_worker,
-            "P/D pressure shadow decision"
+            "P/D pressure decision committed"
         );
     }
 }
@@ -266,7 +272,7 @@ impl PendingStageSelection<'_> {
             let committed = policy.commit_prepared(ticket, stage);
             debug_assert_eq!(committed, expected);
         }
-        if let Some(shadow) = self.shadow {
+        if let Some(shadow) = self.pressure_observation {
             shadow.publish();
         }
         self.decision
@@ -384,7 +390,7 @@ fn select_stage<'a>(
                         affinity: None,
                     },
                     cache_commit: None,
-                    shadow: None,
+                    pressure_observation: None,
                 });
             }
             // pick_prefill refused the candidates (non-finite or misaligned
@@ -397,7 +403,7 @@ fn select_stage<'a>(
     }
     let mut decode_prices_used = false;
     let mut cache_commit = None;
-    let mut shadow = None;
+    let mut pressure_observation = None;
     let (picked, affinity_outcome, affinity_binding) = if stage == Stage::Decode && kv_aware {
         // Decode never queries placement or applies the P temperature:
         // deterministic minimum occupancy with rotating equal-load ties, and
@@ -454,21 +460,22 @@ fn select_stage<'a>(
             context.decode_cache
         };
         // PD already supplies one immutable admission load snapshot. Any
-        // alternative subset must be evaluated against this same ordered view
-        // and discarded; only the actual decision becomes a commit ticket.
+        // alternative subset must be evaluated against this same ordered view;
+        // only the actual decision becomes a commit ticket.
         let view = cache.selection_view(&projected, prepared);
-        let decision = cache.evaluate_prepared(&view, view.indices());
-        let picked = decision.worker_index()?;
+        let mut decision = cache.evaluate_prepared(&view, view.indices());
+        let mut picked = decision.worker_index()?;
         let pressure_stage = match stage {
             Stage::Prefill => PressureStage::Prefill,
             Stage::Decode => PressureStage::Decode,
         };
         if let Some(runtime) = context
             .pressure
-            .filter(|runtime| runtime.config(pressure_stage).mode == PressureMode::Shadow)
+            .filter(|runtime| runtime.config(pressure_stage).enabled())
         {
             let config = runtime.config(pressure_stage);
             let mut observation = PressureObservation {
+                mode: config.mode,
                 stage: if stage == Stage::Prefill {
                     "prefill"
                 } else {
@@ -506,6 +513,14 @@ fn select_stage<'a>(
                                     observation.reason = "would_override";
                                     observation.proposed_worker =
                                         Some(workers[selected_indices[proposed]].url().to_owned());
+                                    if config.mode == PressureMode::On {
+                                        // The baseline ticket has no side effects. Drop it,
+                                        // then commit the alternative only after BOTH stage
+                                        // selections succeed in select_pd_pair.
+                                        picked = proposed;
+                                        decision = alternative;
+                                        observation.reason = "override";
+                                    }
                                 } else {
                                     observation.reason = "no_low_pressure_candidate";
                                 }
@@ -516,7 +531,7 @@ fn select_stage<'a>(
                     }
                 }
             }
-            shadow = Some(observation);
+            pressure_observation = Some(observation);
         }
         cache_commit = Some((cache, decision.into_owned()));
         (picked, None, None)
@@ -611,7 +626,7 @@ fn select_stage<'a>(
             affinity: affinity_binding,
         },
         cache_commit,
-        shadow,
+        pressure_observation,
     })
 }
 
@@ -3627,6 +3642,13 @@ mod admission_tests {
     #[test]
     #[cfg(all(feature = "cpu", feature = "ready"))]
     fn failed_decode_discards_prefill_cache_commit_and_success_commits_once() {
+        for mode in [PressureMode::Shadow, PressureMode::On] {
+            failed_decode_discards_prefill_cache_commit_case(mode);
+        }
+    }
+
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn failed_decode_discards_prefill_cache_commit_case(mode: PressureMode) {
         use crate::policies::{CacheAwareConfig, KvRequestTokens};
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3666,7 +3688,10 @@ mod admission_tests {
         };
         let p_policy = CacheAwarePolicy::with_config(config.clone());
         let d_policy = CacheAwarePolicy::with_config(config);
-        let runtime = pressure_runtime(false);
+        let mut pressure_config = crate::kv_pressure::PdPressureConfig::default();
+        pressure_config.prefill.mode = mode;
+        let runtime =
+            crate::kv_pressure::KvPressureRuntime::new(pressure_config, Client::new()).unwrap();
         let now = Instant::now();
         runtime.inject_for_test(PressureStage::Prefill, &p[0], 0.95, now);
         runtime.inject_for_test(PressureStage::Prefill, &p[1], 0.2, now);
@@ -3712,8 +3737,8 @@ mod admission_tests {
             "failed pair published actual-selection or shadow metrics"
         );
 
-        // A leaked P tree update would make worker 0 win despite this reversed
-        // equal-load tie. Reprepare to observe actual tree contents after failure.
+        // A leaked P tree update would make worker 0 win despite its higher
+        // observed load. Reprepare to observe actual tree contents after failure.
         p[0].increment_load();
         let after_failure = prepare(&p_policy, &p);
         let view = p_policy.selection_view(&p, Some(&after_failure));
@@ -3726,6 +3751,9 @@ mod admission_tests {
             .admit(|loads| select_pd_pair(loads, &p, &d, &p_policy, &d_policy, &ctx, true))
             .unwrap();
         let actual = selection.prefill.worker_index;
+        if mode == PressureMode::On {
+            assert_eq!(actual, 1);
+        }
         for (index, worker) in p.iter().enumerate() {
             assert_eq!(worker.processed_requests(), usize::from(index == actual));
         }
@@ -3811,6 +3839,248 @@ mod admission_tests {
 
     #[test]
     #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn deferred_decode_pressure_uses_dispatch_time_observation_once() {
+        let p = pressure_pool("deferred-pressure-p", 1, Stage::Prefill);
+        let d = pressure_pool("deferred-pressure-d", 3, Stage::Decode);
+        let p_policy = pressure_cache();
+        let d_policy = pressure_cache();
+        let warm = pressure_tokens(&d_policy, &d, &[1, 2, 3]);
+        let view = d_policy.selection_view(&d, Some(&warm));
+        d_policy.commit_prepared(d_policy.evaluate_prepared(&view, &[0]), "warmup");
+        let p_cache = pressure_tokens(&p_policy, &p, &[1, 2, 3]);
+        let d_cache = pressure_tokens(&d_policy, &d, &[1, 2, 3]);
+        let mut config = crate::kv_pressure::PdPressureConfig::default();
+        config.decode.mode = PressureMode::On;
+        let runtime = crate::kv_pressure::KvPressureRuntime::new(config, Client::new()).unwrap();
+        let now = Instant::now();
+        for (index, usage) in [(0, 0.95), (1, 0.2), (2, 0.9)] {
+            runtime.inject_for_test(PressureStage::Decode, &d[index], usage, now);
+        }
+        let mut ctx = context();
+        ctx.prefill_cache = Some(&p_cache);
+        ctx.decode_cache = Some(&d_cache);
+        ctx.pressure = Some(&runtime);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _recording = metrics::set_default_local_recorder(&recorder);
+        let manager = Arc::new(PdLoadManager::default());
+        let (_, attempt) = manager
+            .admit_deferred(|loads| {
+                select_pd_pair(loads, &p, &d, &p_policy, &d_policy, &ctx, false)
+            })
+            .unwrap();
+        assert!(attempt.decode_pending_commit());
+        assert!(attempt.decode_endpoint().is_none());
+        assert_eq!(
+            d.iter().map(|w| w.processed_requests()).collect::<Vec<_>>(),
+            vec![1, 0, 0]
+        );
+        assert!(!metrics
+            .render()
+            .contains("vllm_router_pd_pressure_decisions_total"));
+        // Capacity changes while Prefill is executing: D1 is no longer low.
+        let now = Instant::now();
+        for (index, usage) in [(0, 0.95), (1, 0.9), (2, 0.2)] {
+            runtime.inject_for_test(PressureStage::Decode, &d[index], usage, now);
+        }
+        let actual = manager
+            .commit_decode(&attempt, |loads| {
+                select_decode_stage(loads, &d, &d_policy, &ctx)
+            })
+            .unwrap();
+        assert_eq!(actual.worker_index, 2);
+        assert_eq!(
+            d.iter().map(|w| w.processed_requests()).collect::<Vec<_>>(),
+            vec![1, 0, 1]
+        );
+        let metric_lines = || {
+            metrics
+                .render()
+                .lines()
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = metric_lines();
+        assert!(manager
+            .commit_decode(&attempt, |loads| {
+                select_decode_stage(loads, &d, &d_policy, &ctx)
+            })
+            .is_none());
+        assert_eq!(before, metric_lines());
+        assert_eq!(
+            sample(&manager, Stage::Decode, &actual.endpoint).pending_decode_requests,
+            1
+        );
+        attempt.finish_prefill();
+        attempt.begin_decode();
+        attempt.finish_decode();
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn pressure_modes_commit_only_the_actual_pair_without_count_veto() {
+        for p_mode in [PressureMode::Off, PressureMode::Shadow, PressureMode::On] {
+            for d_mode in [PressureMode::Off, PressureMode::Shadow, PressureMode::On] {
+                let p = pressure_pool("on-p", 2, Stage::Prefill);
+                let d = pressure_pool("on-d", 2, Stage::Decode);
+                let p_policy = pressure_cache();
+                let d_policy = pressure_cache();
+                let mut config = crate::kv_pressure::PdPressureConfig::default();
+                config.prefill.mode = p_mode;
+                config.decode.mode = d_mode;
+                let runtime =
+                    crate::kv_pressure::KvPressureRuntime::new(config, Client::new()).unwrap();
+                let now = Instant::now();
+                let mut loads = Loads::default();
+                for (stage, pressure_stage, workers) in [
+                    (Stage::Prefill, PressureStage::Prefill, &p),
+                    (Stage::Decode, PressureStage::Decode, &d),
+                ] {
+                    for (i, usage, count) in [(0, 0.85, 2), (1, 0.70, 3)] {
+                        runtime.inject_for_test(pressure_stage, &workers[i], usage, now);
+                        loads.insert(
+                            (stage, PdEndpoint::for_worker(workers[i].as_ref())),
+                            PdLoadSample {
+                                prefill_requests: count,
+                                pending_decode_requests: count,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+                let p_cache = pressure_tokens(&p_policy, &p, &[1, 2, 3, 4]);
+                let d_cache = pressure_tokens(&d_policy, &d, &[1, 2, 3, 4]);
+                let mut ctx = context();
+                ctx.prefill_cache = Some(&p_cache);
+                ctx.decode_cache = Some(&d_cache);
+                ctx.pressure = Some(&runtime);
+                let recorder =
+                    metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+                let metrics = recorder.handle();
+                let _scope = metrics::set_default_local_recorder(&recorder);
+                let endpoints: Vec<_> = p
+                    .iter()
+                    .map(|w| PdEndpoint::for_worker(w.as_ref()))
+                    .collect();
+                drop(select_stage(
+                    &loads,
+                    Stage::Prefill,
+                    &p,
+                    &endpoints,
+                    &[0, 1],
+                    &p_policy,
+                    &ctx,
+                ));
+                assert!(
+                    metrics.render().is_empty(),
+                    "discarded decision published metrics"
+                );
+                assert!(p.iter().all(|w| w.processed_requests() == 0));
+                let pair =
+                    select_pd_pair(&loads, &p, &d, &p_policy, &d_policy, &ctx, true).unwrap();
+                for (stage, mode, workers, selected) in [
+                    ("prefill", p_mode, &p, pair.prefill.worker_index),
+                    ("decode", d_mode, &d, pair.decode.worker_index),
+                ] {
+                    let expected = usize::from(mode == PressureMode::On);
+                    assert_eq!(selected, expected, "{stage} {mode:?}");
+                    assert_eq!(workers[expected].processed_requests(), 1);
+                    assert_eq!(workers[1 - expected].processed_requests(), 0);
+                    let total: f64 = metrics
+                        .render()
+                        .lines()
+                        .filter(|l| {
+                            l.starts_with("vllm_router_pd_pressure_overrides_total{")
+                                && l.contains(&format!("stage=\"{stage}\""))
+                        })
+                        .map(|l| l.split_whitespace().last().unwrap().parse::<f64>().unwrap())
+                        .sum();
+                    assert_eq!(total, expected as f64);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn pressure_on_fallback_is_stage_local_and_rollback_keeps_live_attempts() {
+        for (name, high, low, complete, stale) in [
+            ("below_high", 0.849, 0.2, true, false),
+            ("above_low", 0.9, 0.701, true, false),
+            ("all_high", 0.9, 0.95, true, false),
+            ("missing", 0.9, 0.2, false, false),
+            ("invalid", 0.9, f64::NAN, true, false),
+            ("stale", 0.9, 0.2, true, true),
+        ] {
+            let p = pressure_pool("fallback-on-p", 2, Stage::Prefill);
+            let d = pressure_pool("fallback-on-d", 2, Stage::Decode);
+            let p_policy = pressure_cache();
+            let d_policy = pressure_cache();
+            let mut config = crate::kv_pressure::PdPressureConfig::default();
+            config.prefill.mode = PressureMode::On;
+            config.decode.mode = PressureMode::On;
+            let runtime =
+                crate::kv_pressure::KvPressureRuntime::new(config, Client::new()).unwrap();
+            let now = Instant::now();
+            runtime.inject_for_test(PressureStage::Prefill, &p[0], high, now);
+            if complete {
+                runtime.inject_for_test(
+                    PressureStage::Prefill,
+                    &p[1],
+                    low,
+                    if stale {
+                        now - Duration::from_secs(6)
+                    } else {
+                        now
+                    },
+                );
+            }
+            runtime.inject_for_test(PressureStage::Decode, &d[0], 0.9, now);
+            runtime.inject_for_test(PressureStage::Decode, &d[1], 0.2, now);
+            // Pin the baseline by a real prefix warmup, independently of randomized cold ties.
+            for (policy, workers) in [(&p_policy, &p), (&d_policy, &d)] {
+                let prepared = pressure_tokens(policy, workers, &[1, 2, 3]);
+                let view = policy.selection_view(workers, Some(&prepared));
+                policy.commit_prepared(policy.evaluate_prepared(&view, &[0]), "warmup");
+            }
+            let p_cache = pressure_tokens(&p_policy, &p, &[1, 2, 3]);
+            let d_cache = pressure_tokens(&d_policy, &d, &[1, 2, 3]);
+            let mut ctx = context();
+            ctx.prefill_cache = Some(&p_cache);
+            ctx.decode_cache = Some(&d_cache);
+            ctx.pressure = Some(&runtime);
+            let manager = Arc::new(PdLoadManager::default());
+            let (selection, on_attempt) = manager
+                .admit(|loads| select_pd_pair(loads, &p, &d, &p_policy, &d_policy, &ctx, true))
+                .unwrap();
+            assert_eq!(selection.prefill.worker_index, 0, "{name}");
+            assert_eq!(
+                selection.decode.worker_index, 1,
+                "P failure must not disable valid D on: {name}"
+            );
+            assert_eq!(
+                sample(&manager, Stage::Decode, &selection.decode.endpoint).pending_decode_requests,
+                1
+            );
+            // A fresh off request uses baseline while an existing on attempt
+            // retains its original target and releases that target exactly once.
+            ctx.pressure = None;
+            let (_, off_attempt) = manager
+                .admit(|loads| select_pd_pair(loads, &p, &d, &p_policy, &d_policy, &ctx, true))
+                .unwrap();
+            on_attempt.finish_prefill();
+            on_attempt.begin_decode();
+            on_attempt.finish_decode();
+            on_attempt.release();
+            drop(off_attempt);
+            assert!(manager.snapshot().is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "cpu", feature = "ready"))]
     fn cache_pressure_shadow_proposes_low_pressure_worker_without_count_veto() {
         let p = pressure_pool("pressure-p", 2, Stage::Prefill);
         let d = pressure_pool("pressure-d", 1, Stage::Decode);
@@ -3853,7 +4123,7 @@ mod admission_tests {
             &ctx,
         )
         .unwrap();
-        let shadow = pending.shadow.as_ref().unwrap();
+        let shadow = pending.pressure_observation.as_ref().unwrap();
         assert_eq!(shadow.reason, "would_override");
         assert_eq!(shadow.baseline_worker, p[0].url());
         assert_eq!(shadow.proposed_worker.as_deref(), Some(p[1].url()));
@@ -3915,7 +4185,7 @@ mod admission_tests {
             &ctx,
         )
         .unwrap();
-        let shadow = pending.shadow.as_ref().unwrap();
+        let shadow = pending.pressure_observation.as_ref().unwrap();
         assert_eq!(shadow.reason, "missing_tokens");
         assert!(shadow.proposed_worker.is_none());
         drop(pending);
@@ -4022,7 +4292,7 @@ mod admission_tests {
                     &ctx,
                 )
                 .unwrap();
-                let observation = pending.shadow.as_ref().unwrap();
+                let observation = pending.pressure_observation.as_ref().unwrap();
                 assert_eq!(observation.reason, reason, "{stage:?}/{name}");
                 assert_eq!(observation.baseline_worker, workers[0].url());
                 assert_eq!(
@@ -4052,7 +4322,14 @@ mod admission_tests {
 
     #[test]
     #[cfg(all(feature = "cpu", feature = "ready"))]
-    fn cache_pressure_shadow_recomputes_affinity_inside_low_pressure_subset() {
+    fn cache_pressure_modes_recompute_affinity_inside_low_pressure_subset() {
+        for mode in [PressureMode::Shadow, PressureMode::On] {
+            pressure_affinity_subset_case(mode);
+        }
+    }
+
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn pressure_affinity_subset_case(mode: PressureMode) {
         let p = pressure_pool("pressure-affinity-p", 3, Stage::Prefill);
         let policy = pressure_cache();
         let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -4066,7 +4343,9 @@ mod admission_tests {
                 "prefill",
             );
         }
-        let runtime = pressure_runtime(false);
+        let mut config = crate::kv_pressure::PdPressureConfig::default();
+        config.prefill.mode = mode;
+        let runtime = crate::kv_pressure::KvPressureRuntime::new(config, Client::new()).unwrap();
         let now = Instant::now();
         for (index, usage) in [(0, 0.95), (1, 0.2), (2, 0.3)] {
             runtime.inject_for_test(PressureStage::Prefill, &p[index], usage, now);
@@ -4099,12 +4378,20 @@ mod admission_tests {
             &ctx,
         )
         .unwrap();
-        let shadow = pending.shadow.as_ref().unwrap();
+        let shadow = pending.pressure_observation.as_ref().unwrap();
         assert_eq!(
-            pending.decision.worker_index, 0,
-            "global best prefix is the baseline"
+            pending.decision.worker_index,
+            usize::from(mode == PressureMode::On),
+            "only on dispatches to the best prefix within the low subset"
         );
-        assert_eq!(shadow.reason, "would_override");
+        assert_eq!(
+            shadow.reason,
+            if mode == PressureMode::On {
+                "override"
+            } else {
+                "would_override"
+            }
+        );
         assert_eq!(
             shadow.proposed_worker.as_deref(),
             Some(p[1].url()),
@@ -4114,6 +4401,17 @@ mod admission_tests {
             p.iter().all(|worker| worker.processed_requests() == 1),
             "evaluations must not publish another selection"
         );
+        pending.commit("prefill");
+        for (index, worker) in p.iter().enumerate() {
+            assert_eq!(
+                worker.processed_requests(),
+                if index == usize::from(mode == PressureMode::On) {
+                    2
+                } else {
+                    1
+                }
+            );
+        }
     }
 
     #[test]

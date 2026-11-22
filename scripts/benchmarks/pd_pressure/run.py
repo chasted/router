@@ -492,7 +492,7 @@ def provenance(recorder, args):
         recorder.data["untracked_source_sha256"][relative] = sha256(destination)
     recorder.data["runner_sha256"] = sha256(__file__)
     python_action = args.action in ("experiment", "report") or (
-        args.action == "stress" and getattr(args, "stage", 1) == 3
+        args.action == "stress" and getattr(args, "stage", 1) in (3, 4)
     )
     executable = (
         sys.executable
@@ -553,6 +553,25 @@ def parser():
         help="new artifact directory; never overwritten",
     )
     cli.add_argument("--cargo", default="cargo")
+    cli.add_argument(
+        "--router-binary", type=Path, help="stage 4: actual compiled Rust vllm-router"
+    )
+    cli.add_argument(
+        "--simulation-profile",
+        action="append",
+        choices=(
+            "low",
+            "p_hot",
+            "d_hot",
+            "both_hot",
+            "all_hot",
+            "recovery",
+            "signal_fault",
+        ),
+    )
+    cli.add_argument(
+        "--simulation-modes", action="append", choices=("p", "d", "both", "aa")
+    )
     cli.add_argument("--profile", choices=("test", "release"), default="release")
     cli.add_argument(
         "--vllm", help="explicit vLLM executable; required except for stress"
@@ -604,6 +623,16 @@ def main(argv=None):
         cli.error("experiment requires --plan pointing to an existing JSON file")
     if args.action == "report" and (not args.input_dir or not args.input_dir.is_dir()):
         cli.error("report requires --input-dir pointing to experiment evidence")
+    if args.stage == 4:
+        if args.action != "stress":
+            cli.error(
+                "stage 4 supports stress; use stage 3 for deployment experiment/report"
+            )
+        if not args.router_binary or not args.router_binary.is_file():
+            cli.error(
+                "stage 4 requires --router-binary pointing to a compiled Rust router"
+            )
+        args.router_binary = args.router_binary.resolve()
     if args.action == "serve":
         if not all(
             (
@@ -629,12 +658,11 @@ def main(argv=None):
         k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
     }
     try:
-        if args.action != "probe" and args.stage == 4:
-            return recorder.finish(
-                "not_implemented",
-                3,
-                f"PR{args.stage} stress contract is not implemented",
-            )
+        if args.stage == 4:
+            provenance(recorder, args)
+            from high_pressure import suite
+
+            return suite(recorder, args)
         if args.action in ("experiment", "report") or (
             args.action == "stress" and args.stage == 3
         ):

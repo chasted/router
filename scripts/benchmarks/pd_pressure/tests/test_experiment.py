@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -96,6 +97,56 @@ class Workloads(unittest.TestCase):
 
 
 class Replay(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_telemetry_persistence_leaves_the_request_loop_responsive(self):
+        app = web.Application()
+
+        async def metric(request):
+            return web.Response(text="test_metric 1\n")
+
+        app.router.add_get("/metrics", metric)
+        loop, progress = asyncio.get_running_loop(), []
+        raw_write, json_write = Path.write_bytes, experiment.write_json
+
+        def disk_stall():
+            # A disk operation must allow already-runnable loop work to run.
+            # Calling this synchronously on the loop deterministically times out.
+            resumed = threading.Event()
+            loop.call_soon_threadsafe(resumed.set)
+            progress.append(resumed.wait(0.25))
+
+        def slow_bytes(path, data):
+            disk_stall()
+            return raw_write(path, data)
+
+        def slow_json(path, value):
+            disk_stall()
+            return json_write(path, value)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            async with server(
+                app
+            ) as url, experiment.aiohttp.ClientSession() as session:
+                sampler = experiment.Sampler(
+                    Path(tmp) / "metrics",
+                    [{"name": "test", "stage": "router", "url": url + "/metrics"}],
+                    0.05,
+                )
+                with mock.patch.object(
+                    Path, "write_bytes", slow_bytes
+                ), mock.patch.object(experiment, "write_json", slow_json):
+                    await sampler.sample(session)
+                self.assertEqual(
+                    progress,
+                    [True, True],
+                    "disk persistence blocked the request event loop",
+                )
+                self.assertFalse(sampler.errors)
+                item = sampler.samples[0]
+                self.assertEqual(
+                    item["sha256"],
+                    experiment.file_hash(Path(tmp) / "metrics" / item["raw_file"]),
+                )
+
     async def exercise(
         self,
         fault=None,

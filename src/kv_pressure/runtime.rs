@@ -29,6 +29,13 @@ impl KvPressureRuntime {
         &self.observations
     }
     pub fn start(self: &Arc<Self>, registry: Arc<WorkerRegistry>) {
+        for stage in [PressureStage::Prefill, PressureStage::Decode] {
+            if self.config(stage).mode == super::PressureMode::On {
+                // A measured zero distinguishes no overrides from a missing metric.
+                metrics::counter!("vllm_router_pd_pressure_overrides_total", "stage" => stage.as_str())
+                    .increment(0);
+            }
+        }
         self.observations.start(registry);
     }
     pub fn shutdown(&self) {

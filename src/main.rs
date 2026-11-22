@@ -136,7 +136,7 @@ struct CliArgs {
     #[arg(long)]
     program_scheduling_config_json: Option<String>,
 
-    /// Native P/D pressure JSON configuration (off/shadow; on is not supported).
+    /// Native P/D pressure JSON configuration (off/shadow/on; default off).
     #[arg(long)]
     pd_pressure_config: Option<String>,
 
@@ -881,7 +881,7 @@ mod tests {
             "--decode",
             "http://d:8000",
             "--pd-pressure-config",
-            r#"{"prefill":{"mode":"shadow"}}"#,
+            r#"{"prefill":{"mode":"on"},"decode":{"mode":"on"}}"#,
         ])
         .unwrap();
         let config = args
@@ -889,7 +889,10 @@ mod tests {
             .unwrap();
         assert!(config.pd_pressure.as_ref().unwrap().prefill.enabled());
         assert!(config.validate().is_ok());
-        for value in ["bad JSON", r#"{"decode":{"mode":"on"}}"#] {
+        for value in [
+            "bad JSON",
+            r#"{"decode":{"mode":"on","low":0.9,"high":0.8}}"#,
+        ] {
             let args = CliArgs::try_parse_from([
                 "vllm-router",
                 "--worker-urls",

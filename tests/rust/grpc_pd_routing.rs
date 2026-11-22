@@ -281,19 +281,24 @@ async fn grpc_pd_unavailable_pool_rejects_before_request_preparation() {
 #[ignore = "run with the PD pressure evaluation script"]
 async fn grpc_pd_cache_aware_pr1_stress() {
     let (rounds, concurrency) = pd_stress_settings();
-    run_grpc_pd_stress(false, rounds, concurrency).await;
+    run_grpc_pd_stress(false, false, rounds, concurrency).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run with the PD pressure evaluation script"]
 async fn grpc_pd_pressure_pr2_stress() {
     let (rounds, concurrency) = pd_stress_settings();
-    run_grpc_pd_stress(true, rounds, concurrency).await;
+    run_grpc_pd_stress(true, false, rounds, concurrency).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn grpc_pd_pressure_shadow_preserves_baseline_handoff() {
-    run_grpc_pd_stress(true, 1, 4).await;
+    run_grpc_pd_stress(true, false, 1, 4).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grpc_pd_pressure_on_uses_actual_pair_handoff() {
+    run_grpc_pd_stress(true, true, 2, 8).await;
 }
 
 fn pd_stress_settings() -> (usize, usize) {
@@ -310,7 +315,7 @@ fn pd_stress_settings() -> (usize, usize) {
     )
 }
 
-async fn run_grpc_pd_stress(shadow: bool, rounds: usize, concurrency: usize) {
+async fn run_grpc_pd_stress(shadow: bool, actual_on: bool, rounds: usize, concurrency: usize) {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     // The two stress modes share process-wide policy counters.
@@ -390,7 +395,7 @@ async fn run_grpc_pd_stress(shadow: bool, rounds: usize, concurrency: usize) {
             stages.insert(
                 stage.to_owned(),
                 json!({
-                    "mode":"shadow", "poll_interval_ms":10, "timeout_ms":300,
+                    "mode":if actual_on { "on" } else { "shadow" }, "poll_interval_ms":10, "timeout_ms":300,
                     "max_age_ms":2000, "max_skew_ms":2000, "mappings":mappings,
                 }),
             );
@@ -502,6 +507,12 @@ async fn run_grpc_pd_stress(shadow: bool, rounds: usize, concurrency: usize) {
                     .unwrap();
                 assert!(String::from_utf8_lossy(&bytes).contains("hello from worker"));
                 let after = metrics().render();
+                if actual_on
+                    && !prefills[1].captured().is_empty()
+                    && !decodes[1].captured().is_empty()
+                {
+                    break;
+                }
                 if ["prefill", "decode"].iter().all(|stage| {
                     delta(
                         &before,
@@ -590,13 +601,18 @@ async fn run_grpc_pd_stress(shadow: bool, rounds: usize, concurrency: usize) {
         .filter(|server| !server.captured().is_empty())
         .count();
     if shadow {
+        let selected = usize::from(actual_on);
         assert_eq!(
-            (prefills[0].captured().len(), decodes[0].captured().len()),
+            (
+                prefills[selected].captured().len(),
+                decodes[selected].captured().len()
+            ),
             (expected, expected)
         );
         assert!(
-            prefills[1].captured().is_empty() && decodes[1].captured().is_empty(),
-            "shadow dispatched to the proposed worker"
+            prefills[1 - selected].captured().is_empty()
+                && decodes[1 - selected].captured().is_empty(),
+            "pressure mode dispatched to the wrong actual worker"
         );
     } else if concurrency >= 8 && rounds >= 2 {
         assert_eq!(used_prefills, 2, "stress never dispatched to both prefills");
@@ -655,15 +671,17 @@ async fn run_grpc_pd_stress(shadow: bool, rounds: usize, concurrency: usize) {
                 ),
                 expected as f64
             );
-            assert_eq!(
-                delta(
-                    &before,
-                    &rendered,
-                    "vllm_router_pd_pressure_decisions_total",
-                    &[stage_label.as_str(), "reason=\"would_override\""]
-                ),
-                expected as f64
-            );
+            if !actual_on {
+                assert_eq!(
+                    delta(
+                        &before,
+                        &rendered,
+                        "vllm_router_pd_pressure_decisions_total",
+                        &[stage_label.as_str(), "reason=\"would_override\""]
+                    ),
+                    expected as f64
+                );
+            }
         }
         let worker_deltas = |name: &str, policy_label: bool| -> f64 {
             servers
@@ -734,8 +752,8 @@ async fn run_grpc_pd_stress(shadow: bool, rounds: usize, concurrency: usize) {
     println!(
         "PD_PRESSURE_STRESS_RESULT {}",
         json!({
-            "stage": if shadow { "pr2" } else { "pr1" },
-            "kind": if shadow { "grpc_pd_shadow" } else { "grpc_pd" },
+            "stage": if actual_on { "pr4" } else if shadow { "pr2" } else { "pr1" },
+            "kind": if actual_on { "grpc_pd_on" } else if shadow { "grpc_pd_shadow" } else { "grpc_pd" },
             "rounds": rounds,
             "concurrency": concurrency,
             "requests": expected,
@@ -745,7 +763,8 @@ async fn run_grpc_pd_stress(shadow: bool, rounds: usize, concurrency: usize) {
             "completion_p50_us": percentile(50),
             "completion_p95_us": percentile(95),
             "final_occupancy": 0,
-            "shadow_actual_baseline": shadow,
+            "shadow_actual_baseline": shadow && !actual_on,
+            "actual_on_low_pressure_pair": actual_on,
             "workers_used": {"prefill": used_prefills, "decode": used_decodes},
             "commit_counts": commit_counts,
             "evidence": "mock gRPC PD handoff, not real-engine TTFT",

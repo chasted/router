@@ -54,7 +54,7 @@ fn worker(url: &str) -> Arc<dyn Worker> {
 }
 
 #[test]
-fn defaults_are_off_and_shadow_without_mappings_is_safe() {
+fn defaults_are_off_and_enabled_modes_without_mappings_fall_back() {
     let config: PdPressureConfig = serde_json::from_str("{}").unwrap();
     assert!(!config.enabled());
     config.validate().unwrap();
@@ -65,7 +65,11 @@ fn defaults_are_off_and_shadow_without_mappings_is_safe() {
     shadow.validate().unwrap();
     let mut on = shadow.clone();
     on.prefill.mode = PressureMode::On;
-    assert!(on.validate().unwrap_err().contains("on is not implemented"));
+    on.validate().unwrap();
+    let runtime = super::KvPressureRuntime::new(on, reqwest::Client::new()).unwrap();
+    assert!(runtime
+        .snapshot(PressureStage::Prefill, &[], &[], Instant::now())
+        .is_err());
 }
 
 #[test]

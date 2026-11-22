@@ -105,7 +105,7 @@ class Router:
         health_check_endpoint: Health check endpoint path. Default: '/health'
         enable_program_scheduling: Enable Program-level scheduling with verified exact counts and estimation fallback. Default: False
         pd_pressure_config: Optional JSON string configuring native P/D pressure observation.
-            Each enabled stage requires cache_aware; off/shadow only. Program scheduling,
+            Each enabled stage requires cache_aware; off/shadow/on, default off. Program scheduling,
             IGW, vLLM discovery-address mode and mini-lb are unsupported. Default: None
         program_scheduling_config_json: Optional JSON object overriding Program-level scheduling defaults.
             Requires enable_program_scheduling. Use {"token_count_mode":"estimated"}

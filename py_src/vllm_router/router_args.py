@@ -149,7 +149,7 @@ class RouterArgs:
             f"--{prefix}pd-pressure-config",
             type=str,
             default=RouterArgs.pd_pressure_config,
-            help="Native P/D pressure JSON configuration (off/shadow; on and mini-lb are unsupported)",
+            help="Native P/D pressure JSON configuration (off/shadow/on; default off; mini-lb unsupported)",
         )
 
         parser.add_argument(

@@ -10,6 +10,14 @@ pub enum PressureMode {
 }
 
 impl PressureMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::On => "on",
+        }
+    }
+
     pub fn enabled(self) -> bool {
         self != Self::Off
     }
@@ -90,9 +98,6 @@ impl StagePressureConfig {
     }
 
     fn validate(&self) -> Result<(), String> {
-        if self.mode == PressureMode::On {
-            return Err("on is not implemented; use off or shadow".into());
-        }
         if !self.low.is_finite()
             || !self.high.is_finite()
             || !(0.0..self.high).contains(&self.low)

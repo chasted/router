@@ -251,11 +251,11 @@ For the optional agent metadata contract, scheduling enablement, request-scoped 
 
 For Program-scoped PD scheduling (D-rank affinity, admission, bounded prefill permits) and warm remote KV reuse with automatic TTL, see [PD Program Scheduling](docs/program_scheduling/pd-program-scheduling.md).
 
-Native P/D `cache_aware` routing also supports optional pressure observation
+Native P/D `cache_aware` routing also supports optional pressure-aware routing
 through `--pd-pressure-config` (the Python keyword is `pd_pressure_config`).
-Prefill and decode default independently to `off`; PR2 supports `shadow` only
-and rejects `on`; the `on` routing change is not implemented. Shadow preserves
-actual baseline routing. Each enabled stage
+Prefill and decode default independently to `off`. `shadow` preserves baseline
+routing; opt-in `on` actually selects a low-pressure alternative when the original
+target is high-pressure and the complete eligible stage snapshot is valid. Each enabled stage
 requires an effective `cache_aware` policy; Program Scheduling, IGW and Python
 MiniLB are unsupported. Enabled pressure also rejects `--vllm-discovery-address`:
 stable worker identity binding for that discovery path is not implemented.

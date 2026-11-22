@@ -22,8 +22,9 @@ class TestPdPressureLauncherArgs:
         assert parse_router_args([]).pd_pressure_config is None
 
     @pytest.mark.parametrize("use_prefix", [False, True])
-    def test_json_passes_through_cli_and_native_constructor(self, use_prefix):
-        value = '{"prefill":{"mode":"shadow"},"decode":{"mode":"off"}}'
+    @pytest.mark.parametrize("mode", ["shadow", "on"])
+    def test_json_passes_through_cli_and_native_constructor(self, use_prefix, mode):
+        value = '{"prefill":{"mode":"' + mode + '"},"decode":{"mode":"off"}}'
         prefix = "router-" if use_prefix else ""
         parser = argparse.ArgumentParser()
         RouterArgs.add_cli_args(parser, use_router_prefix=use_prefix)

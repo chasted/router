@@ -1,10 +1,79 @@
 # P/D pressure routing: per-PR stress and benchmark evidence
 
+## PR4 real-router high-pressure simulation
+
+This starts the actual compiled Rust router against four local HTTP engines
+(2P+2D) implemented in `capacity_sim.py`. The Python engines never choose a
+route. Actual cache-aware decisions, pressure scraping/validation, pair admission,
+metadata handoff and request occupancy execute in the Rust router. There is no
+model, accelerator or physical KV connector in this experiment.
+
+Each simulated engine has 128 capacity blocks and 8 service slots. Background
+requests hold 116 blocks (90.625%) on hot workers or 16 (12.5%) on low-pressure
+workers. A foreground request reserves `3 + ceil(input_words / 64)` blocks;
+unallocated waiting requests do not count as used blocks. The metric is
+`(background + allocated foreground blocks) / 128`. Capacity and slot exhaustion
+cause actual asynchronous waiting. Prefill service takes
+`0.03 + (input_words - cached_prefix_words) * 0.0005` seconds, with up to 32
+prefix words reused after the first visit. Decode simulates metadata transfer
+and emits one chunk every 0.01 seconds. These are declared simulation parameters,
+identical across arms, not calibrated vLLM or NPU timings.
+
+```bash
+export RUSTUP_TOOLCHAIN=1.95.0
+export CARGO_BUILD_JOBS=2
+export CARGO_PROFILE_DEV_DEBUG=0
+export CARGO_PROFILE_TEST_DEBUG=0
+export CARGO_INCREMENTAL=0
+cargo build --features cpu,ready --bin vllm-router
+python3 -B scripts/benchmarks/pd_pressure/run.py stress \
+  --stage 4 --base-ref BASE_COMMIT_SHA \
+  --router-binary /absolute/path/to/vllm-router \
+  --num-prompts 64 --request-rate 32 --stress-concurrency 64 \
+  --repeat 2 --timeout 300 --out-dir /absolute/new/results
+```
+
+Requires Python 3.10+, aiohttp, Linux/WSL process groups and an existing router
+binary. `--simulation-profile` can be repeated to select `low`, `p_hot`, `d_hot`,
+`both_hot`, `all_hot`, `recovery`, `signal_fault` (default: all). Each profile
+compares off with P-only on, D-only on and both on. `--simulation-modes p|d|both`
+selects candidates; `--simulation-modes aa` instead runs off/off A/A. Every
+comparison has independently reset AB then BA pairs (`--repeat >= 2`), the same
+fixed input/arrival trace and eight sequential warmup calls. There are eight
+initial burst arrivals, followed by the configured sustained rate. Long/short
+inputs are 257/65 words, not vLLM tokens. No arm-specific speedup is injected.
+
+`recovery` releases the hot background after 1 second. `signal_fault` exports
+an incorrect P1 epoch between 0.6 and 1.4 seconds while leaving its health and
+capacity intact; a sufficiently long trace must exercise real-router identity
+fallback. The profile starts after warmup and 150 ms before replay; both the
+profile events and measured request times are retained. Queueing/phase results
+should be interpreted using those timestamps, not assumed instantaneous polling.
+
+Every round drains, captures backend request/handoff records, and shuts down
+the owned router process before the next round. AB/BA includes on-to-off
+restart comparisons. Existing in-flight attempt accounting across mode changes
+is separately covered by Rust admission tests; this is not a hot-reload test.
+Counter deltas must account for every measured decision in enabled stages;
+backend IDs, completions and handoffs must reconcile one-to-one; both backend
+allocations and actual router P/pending-D/active-D occupancy must end at zero.
+
+`simulated-results.md/json` summarize all rounds. Each child contains the PR3
+plan, raw request JSONL, raw Prometheus samples, process logs, source/binary
+hashes, `backend-audit.json`, `reconciled.json` and paired reports. Completion
+denominators include every planned request. TTFT is first generated content
+minus HTTP-call start; queue time is additionally recorded inside each engine.
+The predeclared functional budgets are zero failures, client lag <=100 ms and
+mean paired per-length-group TTFT regression <=15%. Any violations remain in
+the output. Two pairs yield no confidence interval; use >=3 for a paired-round
+bootstrap interval. Mock `performance_accepted` remains false: simulated
+improvement characterizes this capacity/service model, not NPU production gains.
+
 `scripts/benchmarks/pd_pressure/run.py` records per-PR evidence. PR1/2 and the
 official-CLI adapter use the standard library; PR3's HTTP client and fixtures
 also require `aiohttp` (already a project dependency), with Python 3.10+.
 PR3 can start only the processes explicitly declared in an experiment plan.
-Other actions do not launch deployment services. CPU stress and live
+Stage 4 starts a real Rust router and local finite-capacity simulated workers; other actions do not launch deployment services. CPU stress and live
 benchmarks are different evidence: CPU tests establish routing/accounting
 behavior; `vllm bench serve` can measure client-observed TTFT through the public
 HTTP API. HTTP P/D is the primary validation path; gRPC P/D remains a
@@ -25,7 +94,7 @@ established separately. The runner does not infer them from an HTTP URL.
 | PR2 HTTP P/D | Target `pd_pressure_routing`, exact filter `http_pd_pressure_pr2_stress` | Four independent stage-mode combinations. |
 | PR2 gRPC P/D | Target `grpc_pd_routing`, exact filter `grpc_pd_pressure_pr2_stress` | Shadow compatibility and baseline preservation. |
 | PR3 | Python `mock_pd.selftest`, through `stress --stage 3` | A/A and off/shadow tooling selftests, explicit experiment plans and strict reports. |
-| PR4 | Not registered | Exits 3 with `not_implemented`; no success claim. |
+| PR4 | `high_pressure.suite`, through `stress --stage 4` | Real Rust HTTP router, opt-in on, capacity/queue simulation and paired reports. |
 
 Each later PR must implement its stress test, register its actual entry point,
 update the tests, and document the new evidence before
@@ -123,9 +192,9 @@ PR3 adds experiment tooling; actual pressure overrides remain a PR4 feature.
 The Rust CLI and Python launcher accept the same `--pd-pressure-config` JSON
 string; the Python constructor keyword is `pd_pressure_config`. The Rust
 `RouterConfig` JSON field is the structured object `pd_pressure`. Omission
-means both stages are off. Each stage defaults to off independently; PR2 accepts
-only `off` and `shadow`, and rejects `on`; the `on` routing change is not
-implemented. When both are off, no pressure
+means both stages are off. Each stage defaults to off independently. `shadow`
+keeps the baseline; `on` commits the proposed low-pressure target after both
+stage selections succeed. When both are off, no pressure
 collector starts and existing Rust routing modes retain their original path.
 Invalid configuration is rejected even when off. Python MiniLB rejects any
 explicit pressure configuration rather than silently ignoring it.
@@ -136,6 +205,18 @@ Scheduling and IGW are unsupported. Enabled pressure also rejects the vLLM ZMQ
 `--vllm-discovery-address` / `discovery_address` path: its candidates are rebuilt
 without the stable registry bindings required by the collector. Omission or
 explicit all-off preserves the existing Rust discovery behavior.
+In `on`, the original target must have `usage >= high` (default 0.85).
+Alternatives must belong to the same original eligible stage pool and have
+`usage <= low` (default 0.70). The complete stage snapshot must pass the same
+identity, age, skew and layout checks as shadow. The original cache-aware rule
+is evaluated again inside that low-pressure subset, including affinity and
+its existing imbalance logic. A larger request count does not veto a candidate.
+Invalid signals, missing effective tokens or no low-pressure candidate retain
+the stage baseline. Only the final actual pair updates cache trees and occupancy.
+`vllm_router_pd_pressure_overrides_total{stage}` counts committed actual overrides;
+decision counters distinguish mode `on`/reason `override` from shadow proposals.
+Modes are startup configuration: drain and restart with `off` to roll back;
+there is no runtime configuration API.
 HTTP P/D is the primary deployment path;
 gRPC shares routing compatibility but still needs an explicit HTTP(S) metrics
 endpoint. Neither an HTTP inference URL nor a gRPC URL establishes the metrics

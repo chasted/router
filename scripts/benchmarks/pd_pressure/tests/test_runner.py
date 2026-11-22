@@ -631,12 +631,14 @@ class RecordingAndCapabilities(unittest.TestCase):
             )
             self.assertEqual(saved["status"], "unsupported")
 
-    def test_unimplemented_stage_records_failure_without_invoking_cargo(self):
+    def test_stage_four_requires_actual_router_without_invoking_cargo(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
             runner.Recorder, "run"
         ) as execute:
-            with contextlib.redirect_stdout(io.StringIO()):
-                result = runner.main(
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(
+                SystemExit
+            ) as error:
+                runner.main(
                     [
                         "stress",
                         "--stage",
@@ -649,12 +651,9 @@ class RecordingAndCapabilities(unittest.TestCase):
                         "HEAD",
                     ]
                 )
-            self.assertEqual(result, 3)
+            self.assertEqual(error.exception.code, 2)
             execute.assert_not_called()
-            saved = json.loads(
-                (Path(tmp) / "out/manifest.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(saved["status"], "not_implemented")
+            self.assertFalse((Path(tmp) / "out").exists())
 
 
 if __name__ == "__main__":

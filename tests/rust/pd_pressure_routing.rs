@@ -580,6 +580,90 @@ async fn exercise(rounds: usize, concurrency: usize) -> Value {
 }
 
 #[tokio::test]
+async fn http_pd_on_dispatches_actual_pair_and_cleans_up_failures() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _scope = metrics::set_default_local_recorder(&recorder);
+    for (p, d) in [("on", "off"), ("off", "on"), ("on", "on")] {
+        let fixture = Fixture::new(p, d).await;
+        let expected_p = if p == "on" { "p1" } else { "p0" };
+        let expected_d = if d == "on" { "d1" } else { "d0" };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                fixture.seen.dispatched.lock().unwrap().clear();
+                fixture.request(false, StatusCode::OK).await;
+                if fixture
+                    .seen
+                    .dispatched
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .all(|(p, d)| p == expected_p && d.as_deref() == Some(expected_d))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("on never dispatched to the valid low-pressure worker");
+        fixture.seen.dispatched.lock().unwrap().clear();
+        stream::iter(0..32)
+            .map(|i| fixture.request(i % 2 == 0, StatusCode::OK))
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
+        {
+            let records = fixture.seen.dispatched.lock().unwrap();
+            assert_eq!(records.len(), 32);
+            assert!(records
+                .values()
+                .all(|(p, d)| p == expected_p && d.as_deref() == Some(expected_d)));
+        }
+        for (stage, mode) in [("prefill", p), ("decode", d)] {
+            if mode == "on" {
+                assert!(counter(&handle, stage, Some("override")) > 0.0);
+            }
+        }
+        assert_no_pd_occupancy(&handle);
+        for failure in [1, 2] {
+            fixture.seen.fail_stage.store(failure, Ordering::SeqCst);
+            fixture
+                .request(
+                    false,
+                    if failure == 1 {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    },
+                )
+                .await;
+            assert!(fixture
+                .context
+                .worker_registry
+                .get_all()
+                .iter()
+                .all(|w| w.load() == 0));
+            assert_no_pd_occupancy(&handle);
+            fixture.seen.fail_stage.store(0, Ordering::SeqCst);
+        }
+        // Drop a successful streaming body before consuming it: the actual
+        // selected pair, including D's pending/active state, must be released.
+        let response = fixture.router.route_transparent(None, "/v1/completions", &Method::POST,
+            json!({"model":"pressure-model","prompt":"shared pressure prefix","stream":true,"max_tokens":8})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+        assert_no_pd_occupancy(&handle);
+        println!(
+            "PD_PRESSURE_ON_CASE {}",
+            json!({"prefill":p,"decode":d,"requests":32,
+            "actual_prefill":expected_p,"actual_decode":expected_d,"handoffs_verified":32,
+            "failure_cleanup":true,"body_drop_cleanup":true,"final_occupancy":0})
+        );
+    }
+}
+
+#[tokio::test]
 async fn http_pd_shadow_modes_and_signal_failures() {
     exercise(2, 4).await;
 }

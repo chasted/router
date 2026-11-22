@@ -84,7 +84,7 @@ fn program_unavailable(
 /// vLLM PD Router that extends PdRouterBase with vLLM-specific request handling
 #[derive(Debug)]
 pub struct VllmPDRouter {
-    /// Native P/D shadow telemetry, owned and cancelled with this router.
+    /// Native P/D pressure telemetry, owned and cancelled with this router.
     pressure: Option<Arc<crate::kv_pressure::KvPressureRuntime>>,
     epd: Option<super::epd::EncoderStage>,
     /// Underlying PD router for most functionality

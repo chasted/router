@@ -14,7 +14,7 @@ pub struct RouterConfig {
     /// Optional encoder orchestration for E+PD or E/P/D routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epd: Option<EpdConfig>,
-    /// Optional native P/D pressure observation; absent means both stages are off.
+    /// Optional native P/D pressure routing; absent means both stages are off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pd_pressure: Option<crate::kv_pressure::PdPressureConfig>,
     /// Routing mode configuration
@@ -1562,8 +1562,8 @@ mod tests {
             "not json",
             "null",
             r#"{"unknown":true}"#,
-            r#"{"prefill":{"mode":"on"}}"#,
-            r#"{"decode":{"mode":"on"}}"#,
+            r#"{"prefill":{"mode":"invalid"}}"#,
+            r#"{"decode":{"mode":"on","high":1.1}}"#,
             r#"{"prefill":{"mode":"off","poll_interval_ms":0}}"#,
         ] {
             assert!(parse_pd_pressure_config(Some(json)).is_err(), "{json}");

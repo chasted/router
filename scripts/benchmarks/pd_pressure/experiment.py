@@ -370,8 +370,15 @@ class Sampler:
                         self.directory
                         / f"{len(self.samples):05d}-{source['name']}.prom"
                     )
-                    file.write_bytes(raw)
-                    item.update(raw_file=file.name, sha256=file_hash(file))
+
+                    def persist_raw():
+                        file.write_bytes(raw)
+                        return file_hash(file)
+
+                    # Replay shares this event loop. Slow disks (especially
+                    # /mnt mounts) must not delay planned request arrivals.
+                    digest = await asyncio.to_thread(persist_raw)
+                    item.update(raw_file=file.name, sha256=digest)
                     self.first.setdefault(source["name"], text)
                     self.last[source["name"]] = text
             except (
@@ -384,7 +391,11 @@ class Sampler:
                 self.errors.append(copy.deepcopy(item))
             item["ended_ms"] = (time.monotonic() - self.start) * 1000
             self.samples.append(item)
-            write_json(self.directory / "samples.json", self.samples)
+            # Sampling is sequential; await persistence before changing this
+            # list again, while allowing request coroutines to keep running.
+            await asyncio.to_thread(
+                write_json, self.directory / "samples.json", self.samples
+            )
 
     async def loop(self, session):
         while not self.stop.is_set():
