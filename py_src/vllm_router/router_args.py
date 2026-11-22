@@ -68,6 +68,7 @@ class RouterArgs:
     # Explicit Program-level scheduling switch and optional JSON overrides.
     enable_program_scheduling: bool = False
     program_scheduling_config_json: Optional[str] = None
+    pd_pressure_config: Optional[str] = None
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
@@ -142,6 +143,13 @@ class RouterArgs:
             nargs="*",
             default=[],
             help="List of worker URLs (e.g., http://worker1:8000 http://worker2:8000)",
+        )
+
+        parser.add_argument(
+            f"--{prefix}pd-pressure-config",
+            type=str,
+            default=RouterArgs.pd_pressure_config,
+            help="Native P/D pressure JSON configuration (off/shadow; on and mini-lb are unsupported)",
         )
 
         parser.add_argument(

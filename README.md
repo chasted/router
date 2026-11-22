@@ -251,6 +251,23 @@ For the optional agent metadata contract, scheduling enablement, request-scoped 
 
 For Program-scoped PD scheduling (D-rank affinity, admission, bounded prefill permits) and warm remote KV reuse with automatic TTL, see [PD Program Scheduling](docs/program_scheduling/pd-program-scheduling.md).
 
+Native P/D `cache_aware` routing also supports optional pressure observation
+through `--pd-pressure-config` (the Python keyword is `pd_pressure_config`).
+Prefill and decode default independently to `off`; PR2 supports `shadow` only
+and rejects `on`; the `on` routing change is not implemented. Shadow preserves
+actual baseline routing. Each enabled stage
+requires an effective `cache_aware` policy; Program Scheduling, IGW and Python
+MiniLB are unsupported. Enabled pressure also rejects `--vllm-discovery-address`:
+stable worker identity binding for that discovery path is not implemented.
+Both stages off starts no pressure collector and retains existing Rust discovery behavior.
+
+See [P/D pressure configuration and CPU validation](docs/benchmarks/pd_pressure.md#configure-native-pd-pressure-observation)
+for the JSON schema example, explicit metrics mapping and exporter identity
+contract. A native vLLM usage gauge alone cannot establish engine generation or
+KV layout: deployments without a verified identity series retain the baseline.
+CPU shadow tests do not establish real-engine TTFT improvement.
+
+
 ## Advanced Features
 
 ### Kubernetes Service Discovery

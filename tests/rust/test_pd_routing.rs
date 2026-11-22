@@ -1217,6 +1217,7 @@ mod test_pd_routing {
         for (mode, policy) in test_cases {
             let config = RouterConfig {
                 mode,
+                pd_pressure: None,
                 pd_kv_event_sources: Default::default(),
                 kv_event_strict_recovery: false,
                 policy,

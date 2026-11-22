@@ -12,8 +12,11 @@ use crate::core::{
     BasicWorker, CircuitBreaker, CircuitBreakerConfig, ConnectionMode, DPAwareWorker, HealthConfig,
     Worker, WorkerRegistry, WorkerResult, WorkerType,
 };
+use crate::kv_pressure::{PressureMode, PressureStage};
 use crate::policies::WorkerTokenInputs;
-use crate::policies::{kv_aware_ops, LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{
+    kv_aware_ops, CacheAwarePolicy, LoadBalancingPolicy, PolicyRegistry, PreparedCacheDecision,
+};
 use crate::routers::header_utils;
 use async_trait::async_trait;
 use axum::{
@@ -27,7 +30,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// Whether a decode policy can be re-run at dispatch and still produce a
@@ -142,10 +145,19 @@ pub(super) fn select_pd_pair(
         // and the Prefill KV parameters. Scoring it through the policy would
         // consume the decode tie cursor, so the commitment - which advances the
         // cursor itself - would start one tick late and break the tie rotation.
-        provisional_decode(loads, &decode_endpoints, &decode_indices)?
+        PendingStageSelection {
+            decision: provisional_decode(loads, &decode_endpoints, &decode_indices)?,
+            cache_commit: None,
+            shadow: None,
+        }
     };
 
-    Some(PdSelection { prefill, decode })
+    // Publish cache effects only after both required stage decisions succeed.
+    // Provisional Decode carries no effects; its real decision is made later.
+    Some(PdSelection {
+        prefill: prefill.commit("prefill"),
+        decode: decode.commit("decode"),
+    })
 }
 
 /// Deterministic stand-in for a decode decision that will be taken later.
@@ -203,6 +215,7 @@ pub(super) fn select_decode_stage(
         decode_policy,
         context,
     )
+    .map(|pending| pending.commit("decode"))
 }
 
 /// Whether a worker can serve this request model: the part of candidate eligibility that
@@ -212,15 +225,63 @@ pub(super) fn model_eligible(worker: &dyn Worker, model_id: Option<&str>) -> boo
     model_id.is_none_or(|model| worker.model_id() == "unknown" || worker.model_id() == model)
 }
 
-fn select_stage(
+struct PendingStageSelection<'a> {
+    decision: StageDecision,
+    cache_commit: Option<(&'a CacheAwarePolicy, PreparedCacheDecision<'static>)>,
+    shadow: Option<PressureObservation>,
+}
+
+struct PressureObservation {
+    stage: &'static str,
+    reason: &'static str,
+    baseline_worker: String,
+    proposed_worker: Option<String>,
+}
+
+impl PressureObservation {
+    fn publish(self) {
+        metrics::counter!(
+            "vllm_router_pd_pressure_decisions_total",
+            "stage" => self.stage,
+            "mode" => "shadow",
+            "reason" => self.reason,
+        )
+        .increment(1);
+        debug!(
+            stage = self.stage,
+            reason = self.reason,
+            baseline = self.baseline_worker,
+            proposed = self.proposed_worker,
+            "P/D pressure shadow decision"
+        );
+    }
+}
+
+impl PendingStageSelection<'_> {
+    fn commit(self, stage: &'static str) -> StageDecision {
+        if let Some((policy, ticket)) = self.cache_commit {
+            // The ticket keeps its originating projected worker and tree;
+            // its index is local to that view, not the public worker pool.
+            let expected = ticket.worker_index();
+            let committed = policy.commit_prepared(ticket, stage);
+            debug_assert_eq!(committed, expected);
+        }
+        if let Some(shadow) = self.shadow {
+            shadow.publish();
+        }
+        self.decision
+    }
+}
+
+fn select_stage<'a>(
     loads: &Loads,
     stage: Stage,
     workers: &[Arc<dyn Worker>],
     endpoints: &[PdEndpoint],
     indices: &[usize],
-    policy: &dyn LoadBalancingPolicy,
+    policy: &'a dyn LoadBalancingPolicy,
     context: &PdRequestContext<'_>,
-) -> Option<StageDecision> {
+) -> Option<PendingStageSelection<'a>> {
     let policy_input = context.legacy_policy_input;
     let kv_aware = kv_aware_ops(policy).is_some();
     // Keep the caller slice order. Static pools pass registry registration
@@ -303,23 +364,27 @@ fn select_stage(
                 crate::metrics::RouterMetrics::record_prefix_routing_decision(
                     "kv_aware", "prefill", outcome,
                 );
-                return Some(StageDecision {
-                    worker_index: selected_indices[picked],
-                    endpoint: endpoints[selected_indices[picked]].clone(),
-                    score: Some(costs[picked]),
-                    new_prefill_tokens: Some(new_tokens),
-                    credited_prefix_tokens: Some(
-                        tokens
-                            .iter()
-                            .map(|ids| ids.len() as u64)
-                            .sum::<u64>()
-                            .saturating_sub(new_tokens),
-                    ),
-                    fallback_reason: input
-                        .fallback_reason
-                        .or((!estimate.placement_verified).then_some("unverified_placement")),
-                    affinity_outcome: None,
-                    affinity: None,
+                return Some(PendingStageSelection {
+                    decision: StageDecision {
+                        worker_index: selected_indices[picked],
+                        endpoint: endpoints[selected_indices[picked]].clone(),
+                        score: Some(costs[picked]),
+                        new_prefill_tokens: Some(new_tokens),
+                        credited_prefix_tokens: Some(
+                            tokens
+                                .iter()
+                                .map(|ids| ids.len() as u64)
+                                .sum::<u64>()
+                                .saturating_sub(new_tokens),
+                        ),
+                        fallback_reason: input
+                            .fallback_reason
+                            .or((!estimate.placement_verified).then_some("unverified_placement")),
+                        affinity_outcome: None,
+                        affinity: None,
+                    },
+                    cache_commit: None,
+                    shadow: None,
                 });
             }
             // pick_prefill refused the candidates (non-finite or misaligned
@@ -331,6 +396,8 @@ fn select_stage(
         }
     }
     let mut decode_prices_used = false;
+    let mut cache_commit = None;
+    let mut shadow = None;
     let (picked, affinity_outcome, affinity_binding) = if stage == Stage::Decode && kv_aware {
         // Decode never queries placement or applies the P temperature:
         // deterministic minimum occupancy with rotating equal-load ties, and
@@ -386,18 +453,72 @@ fn select_stage(
         } else {
             context.decode_cache
         };
-        // PD already supplies one immutable admission load snapshot. Evaluate
-        // against that view, then publish only the actual stage decision.
+        // PD already supplies one immutable admission load snapshot. Any
+        // alternative subset must be evaluated against this same ordered view
+        // and discarded; only the actual decision becomes a commit ticket.
         let view = cache.selection_view(&projected, prepared);
         let decision = cache.evaluate_prepared(&view, view.indices());
-        let picked = cache.commit_prepared(
-            decision,
-            if stage == Stage::Prefill {
-                "prefill"
-            } else {
-                "decode"
-            },
-        )?;
+        let picked = decision.worker_index()?;
+        let pressure_stage = match stage {
+            Stage::Prefill => PressureStage::Prefill,
+            Stage::Decode => PressureStage::Decode,
+        };
+        if let Some(runtime) = context
+            .pressure
+            .filter(|runtime| runtime.config(pressure_stage).mode == PressureMode::Shadow)
+        {
+            let config = runtime.config(pressure_stage);
+            let mut observation = PressureObservation {
+                stage: if stage == Stage::Prefill {
+                    "prefill"
+                } else {
+                    "decode"
+                },
+                reason: "missing_tokens",
+                baseline_worker: workers[selected_indices[picked]].url().to_owned(),
+                proposed_worker: None,
+            };
+            // Validate the original worker identities, not the temporary load
+            // wrappers. Missing tokens or any invalid eligible sample fails closed.
+            if decision.has_complete_token_inputs() {
+                match runtime.snapshot(pressure_stage, workers, &selected_indices, Instant::now()) {
+                    Err(reason) => observation.reason = reason.as_str(),
+                    Ok(snapshot) => {
+                        if let Some(usage) = snapshot.usage(selected_indices[picked]) {
+                            if usage < config.high {
+                                observation.reason = "baseline_below_high";
+                            } else {
+                                let low: Vec<_> = view
+                                    .indices()
+                                    .iter()
+                                    .copied()
+                                    .filter(|&index| {
+                                        snapshot
+                                            .usage(selected_indices[index])
+                                            .is_some_and(|usage| usage <= config.low)
+                                    })
+                                    .collect();
+                                // Recompute prefix affinity and imbalance inside the low
+                                // subset, using exactly the baseline's frozen load view.
+                                // Request-count differences never veto this proposal.
+                                let alternative = cache.evaluate_prepared(&view, &low);
+                                if let Some(proposed) = alternative.worker_index() {
+                                    observation.reason = "would_override";
+                                    observation.proposed_worker =
+                                        Some(workers[selected_indices[proposed]].url().to_owned());
+                                } else {
+                                    observation.reason = "no_low_pressure_candidate";
+                                }
+                            }
+                        } else {
+                            observation.reason = "missing_sample";
+                        }
+                    }
+                }
+            }
+            shadow = Some(observation);
+        }
+        cache_commit = Some((cache, decision.into_owned()));
         (picked, None, None)
     } else {
         let picked =
@@ -446,47 +567,51 @@ fn select_stage(
                 .map(|prompts| prompts.iter().map(|ids| ids.len() as u64).sum())
         })
         .flatten();
-    Some(StageDecision {
-        fallback_reason: if stage == Stage::Prefill && kv_aware {
-            Some(if unknown_backlog {
-                "unknown_prefill_backlog"
-            } else {
-                projected
-                    .iter()
-                    .find_map(|worker| {
-                        context
-                            .prefill_inputs
-                            .and_then(|inputs| inputs.get(worker.base_url()))
-                            .and_then(|input| input.fallback_reason)
-                    })
-                    .unwrap_or("unverified_effective_tokens")
-            })
-        } else {
-            None
-        },
-        credited_prefix_tokens: selected_tokens.map(|_| 0),
-        worker_index,
-        endpoint: endpoints[worker_index].clone(),
-        // Unknown P token work falls back to occupancy; Decode records the
-        // occupancy plus the same marginal context the selector compared.
-        score: kv_aware.then_some(match stage {
-            Stage::Prefill => worker.load() as f64,
-            Stage::Decode => {
-                let additional = if decode_prices_used {
-                    context
-                        .decode_context
-                        .and_then(|prices| prices.get(worker.url()))
-                        .copied()
-                        .unwrap_or(0)
+    Some(PendingStageSelection {
+        decision: StageDecision {
+            fallback_reason: if stage == Stage::Prefill && kv_aware {
+                Some(if unknown_backlog {
+                    "unknown_prefill_backlog"
                 } else {
-                    0
-                };
-                (worker.load() as u64).saturating_add(additional) as f64
-            }
-        }),
-        new_prefill_tokens: selected_tokens,
-        affinity_outcome,
-        affinity: affinity_binding,
+                    projected
+                        .iter()
+                        .find_map(|worker| {
+                            context
+                                .prefill_inputs
+                                .and_then(|inputs| inputs.get(worker.base_url()))
+                                .and_then(|input| input.fallback_reason)
+                        })
+                        .unwrap_or("unverified_effective_tokens")
+                })
+            } else {
+                None
+            },
+            credited_prefix_tokens: selected_tokens.map(|_| 0),
+            worker_index,
+            endpoint: endpoints[worker_index].clone(),
+            // Unknown P token work falls back to occupancy; Decode records the
+            // occupancy plus the same marginal context the selector compared.
+            score: kv_aware.then_some(match stage {
+                Stage::Prefill => worker.load() as f64,
+                Stage::Decode => {
+                    let additional = if decode_prices_used {
+                        context
+                            .decode_context
+                            .and_then(|prices| prices.get(worker.url()))
+                            .copied()
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    (worker.load() as u64).saturating_add(additional) as f64
+                }
+            }),
+            new_prefill_tokens: selected_tokens,
+            affinity_outcome,
+            affinity: affinity_binding,
+        },
+        cache_commit,
+        shadow,
     })
 }
 
@@ -1577,6 +1702,7 @@ impl PdRouterBase {
             legacy_policy_input: None,
             prefill_cache: None,
             decode_cache: None,
+            pressure: None,
             headers: None,
             affinity_key: None,
             lora_name: None,
@@ -2110,6 +2236,7 @@ mod tests {
             legacy_policy_input: None,
             prefill_cache: None,
             decode_cache: None,
+            pressure: None,
             headers: None,
             affinity_key: None,
             lora_name: None,
@@ -2141,6 +2268,7 @@ mod tests {
             legacy_policy_input: None,
             prefill_cache: None,
             decode_cache: None,
+            pressure: None,
             headers: None,
             affinity_key: None,
             lora_name: None,
@@ -2986,6 +3114,7 @@ mod admission_tests {
             legacy_policy_input: Some("original request"),
             prefill_cache: None,
             decode_cache: None,
+            pressure: None,
             headers: None,
             affinity_key: None,
             lora_name: None,
@@ -3053,6 +3182,7 @@ mod admission_tests {
             legacy_policy_input: Some("original request"),
             prefill_cache: None,
             decode_cache: None,
+            pressure: None,
             headers: None,
             affinity_key: Some(affinity_key(session)),
             lora_name: None,
@@ -3495,6 +3625,548 @@ mod admission_tests {
     }
 
     #[test]
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn failed_decode_discards_prefill_cache_commit_and_success_commits_once() {
+        use crate::policies::{CacheAwareConfig, KvRequestTokens};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug)]
+        struct RejectDecode {
+            prefill: Arc<dyn Worker>,
+            called: AtomicBool,
+        }
+        impl LoadBalancingPolicy for RejectDecode {
+            fn select_worker_with_headers(
+                &self,
+                _: &[Arc<dyn Worker>],
+                _: Option<&str>,
+                _: Option<&RequestHeaders>,
+            ) -> Option<usize> {
+                self.called.store(true, Ordering::Relaxed);
+                assert_eq!(
+                    self.prefill.processed_requests(),
+                    0,
+                    "P committed before D succeeded"
+                );
+                None
+            }
+            fn name(&self) -> &'static str {
+                "reject-decode"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let p = pressure_pool("cache-commit-p", 2, Stage::Prefill);
+        let d = pressure_pool("cache-commit-d", 1, Stage::Decode);
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let p_policy = CacheAwarePolicy::with_config(config.clone());
+        let d_policy = CacheAwarePolicy::with_config(config);
+        let runtime = pressure_runtime(false);
+        let now = Instant::now();
+        runtime.inject_for_test(PressureStage::Prefill, &p[0], 0.95, now);
+        runtime.inject_for_test(PressureStage::Prefill, &p[1], 0.2, now);
+        let tokens = [1, 2, 3, 4];
+        let prepare = |policy: &CacheAwarePolicy, workers: &[Arc<dyn Worker>]| {
+            policy
+                .prepare_selection(
+                    workers,
+                    KvRequestTokens::Shared(Some(&tokens)),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+        };
+        let p_cache = prepare(&p_policy, &p);
+        let d_cache = prepare(&d_policy, &d);
+        let mut ctx = context();
+        ctx.prefill_cache = Some(&p_cache);
+        ctx.decode_cache = Some(&d_cache);
+        ctx.pressure = Some(&runtime);
+        let reject = RejectDecode {
+            prefill: p[0].clone(),
+            called: AtomicBool::new(false),
+        };
+        let manager = Arc::new(PdLoadManager::default());
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _recording = metrics::set_default_local_recorder(&recorder);
+        let before = metrics.render();
+        assert!(manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &p_policy, &reject, &ctx, true))
+            .is_none());
+        assert!(reject.called.load(Ordering::Relaxed));
+        assert!(manager.snapshot().is_empty());
+        assert!(p
+            .iter()
+            .chain(&d)
+            .all(|worker| worker.processed_requests() == 0));
+        assert_eq!(
+            metrics.render(),
+            before,
+            "failed pair published actual-selection or shadow metrics"
+        );
+
+        // A leaked P tree update would make worker 0 win despite this reversed
+        // equal-load tie. Reprepare to observe actual tree contents after failure.
+        p[0].increment_load();
+        let after_failure = prepare(&p_policy, &p);
+        let view = p_policy.selection_view(&p, Some(&after_failure));
+        assert_eq!(
+            p_policy.evaluate_prepared(&view, &[1, 0]).worker_index(),
+            Some(1)
+        );
+
+        let (selection, attempt) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &p_policy, &d_policy, &ctx, true))
+            .unwrap();
+        let actual = selection.prefill.worker_index;
+        for (index, worker) in p.iter().enumerate() {
+            assert_eq!(worker.processed_requests(), usize::from(index == actual));
+        }
+        assert_eq!(d[0].processed_requests(), 1);
+        let after_success = prepare(&p_policy, &p);
+        let view = p_policy.selection_view(&p, Some(&after_success));
+        assert_eq!(
+            p_policy.evaluate_prepared(&view, &[1, 0]).worker_index(),
+            Some(actual)
+        );
+        let rendered = metrics.render();
+        for stage in ["prefill", "decode"] {
+            let total: f64 = rendered
+                .lines()
+                .filter(|line| {
+                    line.starts_with("vllm_router_prefix_routing_decisions_total")
+                        && line.contains(&format!("stage=\"{stage}\""))
+                })
+                .map(|line| {
+                    line.split_whitespace()
+                        .last()
+                        .unwrap()
+                        .parse::<f64>()
+                        .unwrap()
+                })
+                .sum();
+            assert_eq!(total, 1.0, "{stage} committed more than once: {rendered}");
+        }
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn pressure_pool(prefix: &str, count: usize, stage: Stage) -> Vec<Arc<dyn Worker>> {
+        (0..count)
+            .map(|index| {
+                let role = match stage {
+                    Stage::Prefill => WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                    Stage::Decode => WorkerType::Decode,
+                };
+                Arc::new(BasicWorker::new(format!("http://{prefix}{index}"), role))
+                    as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn pressure_runtime(decode: bool) -> Arc<crate::kv_pressure::KvPressureRuntime> {
+        let mut config = crate::kv_pressure::PdPressureConfig::default();
+        config.prefill.mode = PressureMode::Shadow;
+        if decode {
+            config.decode.mode = PressureMode::Shadow;
+        }
+        crate::kv_pressure::KvPressureRuntime::new(config, Client::new()).unwrap()
+    }
+
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn pressure_cache() -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(crate::policies::CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        })
+    }
+
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn pressure_tokens(
+        policy: &CacheAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+        tokens: &[u32],
+    ) -> crate::policies::PreparedCacheSelection {
+        policy
+            .prepare_selection(
+                workers,
+                crate::policies::KvRequestTokens::Shared(Some(tokens)),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn cache_pressure_shadow_proposes_low_pressure_worker_without_count_veto() {
+        let p = pressure_pool("pressure-p", 2, Stage::Prefill);
+        let d = pressure_pool("pressure-d", 1, Stage::Decode);
+        let p_policy = pressure_cache();
+        let d_policy = pressure_cache();
+        let runtime = pressure_runtime(false);
+        let now = Instant::now();
+        runtime.inject_for_test(PressureStage::Prefill, &p[0], 0.95, now);
+        runtime.inject_for_test(PressureStage::Prefill, &p[1], 0.2, now);
+        let p_cache = pressure_tokens(&p_policy, &p, &[1, 2, 3, 4]);
+        let d_cache = pressure_tokens(&d_policy, &d, &[1, 2, 3, 4]);
+        let endpoints: Vec<_> = p
+            .iter()
+            .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
+            .collect();
+        let mut loads = Loads::default();
+        for (index, count) in [(0, 2), (1, 3)] {
+            loads.insert(
+                (Stage::Prefill, endpoints[index].clone()),
+                PdLoadSample {
+                    prefill_requests: count,
+                    ..Default::default()
+                },
+            );
+        }
+        let mut ctx = context();
+        ctx.prefill_cache = Some(&p_cache);
+        ctx.decode_cache = Some(&d_cache);
+        ctx.pressure = Some(&runtime);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _recording = metrics::set_default_local_recorder(&recorder);
+        let pending = select_stage(
+            &loads,
+            Stage::Prefill,
+            &p,
+            &endpoints,
+            &[0, 1],
+            &p_policy,
+            &ctx,
+        )
+        .unwrap();
+        let shadow = pending.shadow.as_ref().unwrap();
+        assert_eq!(shadow.reason, "would_override");
+        assert_eq!(shadow.baseline_worker, p[0].url());
+        assert_eq!(shadow.proposed_worker.as_deref(), Some(p[1].url()));
+        assert_eq!(pending.decision.worker_index, 0);
+        drop(pending);
+        assert!(
+            metrics.render().is_empty(),
+            "discarded pair must not publish shadow or actual metrics"
+        );
+        assert!(p.iter().all(|worker| worker.processed_requests() == 0));
+
+        let pair = select_pd_pair(&loads, &p, &d, &p_policy, &d_policy, &ctx, true).unwrap();
+        assert_eq!(
+            pair.prefill.worker_index, 0,
+            "shadow must retain the baseline dispatch"
+        );
+        assert_eq!(p[0].processed_requests(), 1);
+        assert_eq!(
+            p[1].processed_requests(),
+            0,
+            "alternative must never commit"
+        );
+        let rendered = metrics.render();
+        let pressure: Vec<_> = rendered
+            .lines()
+            .filter(|line| line.starts_with("vllm_router_pd_pressure_decisions_total"))
+            .collect();
+        assert_eq!(
+            pressure.len(),
+            1,
+            "off decode must not publish pressure decisions"
+        );
+        assert!(
+            pressure[0].contains("stage=\"prefill\"")
+                && pressure[0].contains("reason=\"would_override\"")
+                && pressure[0].ends_with(" 1"),
+            "{rendered}"
+        );
+
+        // Some(prepared) does not prove that every eligible backend supplied
+        // effective tokens. A baseline token fallback must not propose a move.
+        let missing = p_policy
+            .prepare_selection(
+                &p,
+                crate::policies::KvRequestTokens::Shared(None),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        ctx.prefill_cache = Some(&missing);
+        let pending = select_stage(
+            &loads,
+            Stage::Prefill,
+            &p,
+            &endpoints,
+            &[0, 1],
+            &p_policy,
+            &ctx,
+        )
+        .unwrap();
+        let shadow = pending.shadow.as_ref().unwrap();
+        assert_eq!(shadow.reason, "missing_tokens");
+        assert!(shadow.proposed_worker.is_none());
+        drop(pending);
+        // Prometheus does not guarantee series iteration order. Compare all
+        // emitted lines, including their exact counter/gauge values, as a set.
+        let after = metrics.render();
+        let mut before_lines: Vec<_> = rendered.lines().collect();
+        let mut after_lines: Vec<_> = after.lines().collect();
+        before_lines.sort_unstable();
+        after_lines.sort_unstable();
+        assert_eq!(after_lines, before_lines);
+    }
+
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn pressure_baseline_loads(stage: Stage, workers: &[Arc<dyn Worker>]) -> Loads {
+        workers
+            .iter()
+            .skip(1)
+            .map(|worker| {
+                let mut sample = PdLoadSample::default();
+                match stage {
+                    Stage::Prefill => sample.prefill_requests = 1,
+                    Stage::Decode => sample.active_decode_requests = 1,
+                }
+                ((stage, PdEndpoint::for_worker(worker.as_ref())), sample)
+            })
+            .collect()
+    }
+
+    #[test]
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn cache_pressure_shadow_threshold_boundaries_and_incomplete_pool_keep_baseline() {
+        // These cases describe the public pressure contract, independently of
+        // cache affinity. A unique minimum load makes worker 0 the original choice.
+        let cases = [
+            ("inclusive_bounds", 0.85, 0.70, true, "would_override", true),
+            (
+                "below_high",
+                0.849999,
+                0.70,
+                true,
+                "baseline_below_high",
+                false,
+            ),
+            (
+                "above_low",
+                0.85,
+                0.700001,
+                true,
+                "no_low_pressure_candidate",
+                false,
+            ),
+            (
+                "middle_band",
+                0.80,
+                0.60,
+                true,
+                "baseline_below_high",
+                false,
+            ),
+            ("full_and_empty", 1.0, 0.0, true, "would_override", true),
+            (
+                "missing_third_sample",
+                0.90,
+                0.60,
+                false,
+                "unbound_worker",
+                false,
+            ),
+        ];
+        let mut results = Vec::new();
+        for (stage, pressure_stage) in [
+            (Stage::Prefill, PressureStage::Prefill),
+            (Stage::Decode, PressureStage::Decode),
+        ] {
+            for (name, original_usage, alternative_usage, complete, reason, proposes) in cases {
+                let workers = pressure_pool("pressure-boundary-", 3, stage);
+                let policy = pressure_cache();
+                let runtime = pressure_runtime(true);
+                let now = Instant::now();
+                runtime.inject_for_test(pressure_stage, &workers[0], original_usage, now);
+                runtime.inject_for_test(pressure_stage, &workers[1], alternative_usage, now);
+                if complete {
+                    runtime.inject_for_test(pressure_stage, &workers[2], 1.0, now);
+                }
+                let prepared = pressure_tokens(&policy, &workers, &[1, 2, 3, 4]);
+                let endpoints: Vec<_> = workers
+                    .iter()
+                    .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
+                    .collect();
+                let mut ctx = context();
+                match stage {
+                    Stage::Prefill => ctx.prefill_cache = Some(&prepared),
+                    Stage::Decode => ctx.decode_cache = Some(&prepared),
+                }
+                ctx.pressure = Some(&runtime);
+                let pending = select_stage(
+                    &pressure_baseline_loads(stage, &workers),
+                    stage,
+                    &workers,
+                    &endpoints,
+                    &[0, 1, 2],
+                    &policy,
+                    &ctx,
+                )
+                .unwrap();
+                let observation = pending.shadow.as_ref().unwrap();
+                assert_eq!(observation.reason, reason, "{stage:?}/{name}");
+                assert_eq!(observation.baseline_worker, workers[0].url());
+                assert_eq!(
+                    observation.proposed_worker.as_deref(),
+                    proposes.then(|| workers[1].url()),
+                    "{stage:?}/{name}"
+                );
+                assert_eq!(pending.decision.worker_index, 0, "{stage:?}/{name}");
+                assert!(workers
+                    .iter()
+                    .all(|worker| worker.processed_requests() == 0));
+                results.push(json!({
+                    "stage": pressure_stage.as_str(), "case": name,
+                    "baseline_usage": original_usage, "alternative_usage": alternative_usage,
+                    "all_candidates_sampled": complete, "reason": observation.reason,
+                    "expected_reason": reason, "actual_worker_index": pending.decision.worker_index,
+                    "proposed_worker_index": observation.proposed_worker.as_deref()
+                        .and_then(|url| workers.iter().position(|worker| worker.url() == url)),
+                    "expected_proposed_worker_index": proposes.then_some(1),
+                    "actual_commits_before_pair": workers.iter()
+                        .map(|worker| worker.processed_requests()).sum::<usize>(),
+                }));
+            }
+        }
+        println!("PD_PRESSURE_BOUNDARIES={}", json!({"cases": results}));
+    }
+
+    #[test]
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn cache_pressure_shadow_recomputes_affinity_inside_low_pressure_subset() {
+        let p = pressure_pool("pressure-affinity-p", 3, Stage::Prefill);
+        let policy = pressure_cache();
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        for (index, length) in [(0, 8), (1, 6), (2, 4)] {
+            policy.select_worker_with_inputs(
+                std::slice::from_ref(&p[index]),
+                crate::policies::KvRequestTokens::Shared(Some(&tokens[..length])),
+                None,
+                None,
+                None,
+                "prefill",
+            );
+        }
+        let runtime = pressure_runtime(false);
+        let now = Instant::now();
+        for (index, usage) in [(0, 0.95), (1, 0.2), (2, 0.3)] {
+            runtime.inject_for_test(PressureStage::Prefill, &p[index], usage, now);
+        }
+        let prepared = pressure_tokens(&policy, &p, &tokens);
+        let endpoints: Vec<_> = p
+            .iter()
+            .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
+            .collect();
+        let mut loads = Loads::default();
+        for (index, count) in [(0, 2), (1, 3), (2, 1)] {
+            loads.insert(
+                (Stage::Prefill, endpoints[index].clone()),
+                PdLoadSample {
+                    prefill_requests: count,
+                    ..Default::default()
+                },
+            );
+        }
+        let mut ctx = context();
+        ctx.prefill_cache = Some(&prepared);
+        ctx.pressure = Some(&runtime);
+        let pending = select_stage(
+            &loads,
+            Stage::Prefill,
+            &p,
+            &endpoints,
+            &[0, 1, 2],
+            &policy,
+            &ctx,
+        )
+        .unwrap();
+        let shadow = pending.shadow.as_ref().unwrap();
+        assert_eq!(
+            pending.decision.worker_index, 0,
+            "global best prefix is the baseline"
+        );
+        assert_eq!(shadow.reason, "would_override");
+        assert_eq!(
+            shadow.proposed_worker.as_deref(),
+            Some(p[1].url()),
+            "best prefix within the low subset wins despite a lower-count peer"
+        );
+        assert!(
+            p.iter().all(|worker| worker.processed_requests() == 1),
+            "evaluations must not publish another selection"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    fn cache_pressure_shadow_keeps_prefill_and_decode_signal_failures_independent() {
+        let p = pressure_pool("pressure-independent-p", 2, Stage::Prefill);
+        let d = pressure_pool("pressure-independent-d", 2, Stage::Decode);
+        let p_policy = pressure_cache();
+        let d_policy = pressure_cache();
+        let runtime = pressure_runtime(true);
+        let now = Instant::now();
+        runtime.inject_for_test(PressureStage::Prefill, &p[0], 0.95, now);
+        runtime.inject_for_test(PressureStage::Prefill, &p[1], 0.2, now);
+        runtime.inject_for_test(PressureStage::Decode, &d[0], 0.95, now);
+        // D1 has no sample: all eligible D signals are required, independently of P.
+        let invalid = runtime
+            .snapshot(PressureStage::Decode, &d, &[0, 1], now)
+            .err()
+            .unwrap();
+        let p_cache = pressure_tokens(&p_policy, &p, &[1, 2, 3, 4]);
+        let d_cache = pressure_tokens(&d_policy, &d, &[1, 2, 3, 4]);
+        let mut ctx = context();
+        ctx.prefill_cache = Some(&p_cache);
+        ctx.decode_cache = Some(&d_cache);
+        ctx.pressure = Some(&runtime);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _recording = metrics::set_default_local_recorder(&recorder);
+        let mut loads = pressure_baseline_loads(Stage::Prefill, &p);
+        loads.extend(pressure_baseline_loads(Stage::Decode, &d));
+        let pair = select_pd_pair(&loads, &p, &d, &p_policy, &d_policy, &ctx, true).unwrap();
+        assert_eq!(
+            (pair.prefill.worker_index, pair.decode.worker_index),
+            (0, 0)
+        );
+        let rendered = metrics.render();
+        for (stage, reason) in [("prefill", "would_override"), ("decode", invalid.as_str())] {
+            assert!(
+                rendered.lines().any(|line| line
+                    .starts_with("vllm_router_pd_pressure_decisions_total")
+                    && line.contains(&format!("stage=\"{stage}\""))
+                    && line.contains(&format!("reason=\"{reason}\""))
+                    && line.ends_with(" 1")),
+                "{rendered}"
+            );
+        }
+        assert_eq!(p[0].processed_requests(), 1);
+        assert_eq!(d[0].processed_requests(), 1);
+        assert_eq!(p[1].processed_requests(), 0);
+        assert_eq!(d[1].processed_requests(), 0);
+    }
+
+    #[test]
     fn cold_prefill_ties_use_every_worker_in_an_idle_pool() {
         let manager = Arc::new(PdLoadManager::default());
         let p = pool("p", 3);
@@ -3737,6 +4409,317 @@ mod admission_tests {
         );
     }
 
+    /// Synthetic shadow decisions and admission cleanup; no backend or TTFT claim.
+    #[test]
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    #[ignore = "run with the PD pressure evaluation script"]
+    fn pd_cache_aware_pr2_stress() {
+        use std::sync::Barrier;
+        let setting = |name: &str, default: usize, max: usize| {
+            let value = std::env::var(name)
+                .map(|value| value.parse::<usize>().unwrap())
+                .unwrap_or(default);
+            assert!((1..=max).contains(&value), "{name} must be in 1..={max}");
+            value
+        };
+        let rounds = setting("ROUTER_PD_STRESS_ROUNDS", 24, 10_000);
+        let concurrency = setting("ROUTER_PD_STRESS_CONCURRENCY", 16, 256);
+        let total = rounds * concurrency;
+        let p = pressure_pool("shadow-stress-p", 2, Stage::Prefill);
+        let d = pressure_pool("shadow-stress-d", 2, Stage::Decode);
+        let p_endpoints: Vec<_> = p
+            .iter()
+            .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
+            .collect();
+        let d_endpoints: Vec<_> = d
+            .iter()
+            .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
+            .collect();
+        let p_policy = pressure_cache();
+        let d_policy = pressure_cache();
+        let runtimes: Vec<_> = (0..4)
+            .map(|scenario| {
+                let mut config = crate::kv_pressure::PdPressureConfig::default();
+                if scenario != 1 {
+                    config.prefill.mode = PressureMode::Shadow;
+                }
+                if scenario != 0 {
+                    config.decode.mode = PressureMode::Shadow;
+                }
+                crate::kv_pressure::KvPressureRuntime::new(config, Client::new()).unwrap()
+            })
+            .collect();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _recording = metrics::set_default_local_recorder(&recorder);
+        let manager = Arc::new(PdLoadManager::default());
+        let sentinel_p = pressure_pool("shadow-sentinel-p", 1, Stage::Prefill).remove(0);
+        let sentinel_d = pressure_pool("shadow-sentinel-d", 1, Stage::Decode).remove(0);
+        let sentinel = manager.admit_bound(sentinel_p.clone(), sentinel_d.clone());
+        let sentinel_loads = manager.snapshot();
+        let started = Instant::now();
+        let tokens = |sequence: usize| [sequence as u32 + 1, 7, 8, 9];
+        for round in 0..rounds {
+            let now = Instant::now();
+            for (scenario, runtime) in runtimes.iter().enumerate() {
+                for (index, usage) in [(0, 0.95), (1, 0.2)] {
+                    runtime.inject_for_test(PressureStage::Prefill, &p[index], usage, now);
+                    if scenario != 3 || index == 0 {
+                        runtime.inject_for_test(PressureStage::Decode, &d[index], usage, now);
+                    }
+                }
+            }
+            let barrier = Barrier::new(concurrency);
+            let admitted: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..concurrency)
+                    .map(|index| {
+                        let sequence = round * concurrency + index;
+                        let runtime = &runtimes[sequence % runtimes.len()];
+                        let p = &p;
+                        let d = &d;
+                        let p_policy = &p_policy;
+                        let d_policy = &d_policy;
+                        let p_endpoints = &p_endpoints;
+                        let d_endpoints = &d_endpoints;
+                        let barrier = &barrier;
+                        let manager = &manager;
+                        let recorder = &recorder;
+                        scope.spawn(move || {
+                            let _recording = metrics::set_default_local_recorder(recorder);
+                            let ids = tokens(sequence);
+                            let p_cache = pressure_tokens(p_policy, p, &ids);
+                            let d_cache = pressure_tokens(d_policy, d, &ids);
+                            let mut ctx = context();
+                            ctx.prefill_cache = Some(&p_cache);
+                            ctx.decode_cache = Some(&d_cache);
+                            barrier.wait();
+                            let (selection, attempt) = manager
+                                .admit(|loads| {
+                                    // Independent calls draw independent random ties.
+                                    // Make this synthetic comparison's load minima
+                                    // unique; PR1 separately tests frozen-view ties.
+                                    let mut comparison_loads = loads.clone();
+                                    for (stage, endpoints) in [
+                                        (Stage::Prefill, p_endpoints),
+                                        (Stage::Decode, d_endpoints),
+                                    ] {
+                                        for (index, endpoint) in endpoints.iter().enumerate() {
+                                            let sample = comparison_loads
+                                                .entry((stage, endpoint.clone()))
+                                                .or_default();
+                                            let count = sample.occupancy(stage) * 2 + index;
+                                            match stage {
+                                                Stage::Prefill => sample.prefill_requests = count,
+                                                Stage::Decode => {
+                                                    sample.pending_decode_requests = 0;
+                                                    sample.active_decode_requests = count;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let loads = &comparison_loads;
+                                    // Off evaluation and shadow actual share the exact admission
+                                    // snapshot, prepared prefixes, and endpoint ordering.
+                                    let expected_p = select_stage(
+                                        loads,
+                                        Stage::Prefill,
+                                        p,
+                                        p_endpoints,
+                                        &[0, 1],
+                                        p_policy,
+                                        &ctx,
+                                    )?
+                                    .decision
+                                    .worker_index;
+                                    let expected_d = select_stage(
+                                        loads,
+                                        Stage::Decode,
+                                        d,
+                                        d_endpoints,
+                                        &[0, 1],
+                                        d_policy,
+                                        &ctx,
+                                    )?
+                                    .decision
+                                    .worker_index;
+                                    ctx.pressure = Some(runtime);
+                                    let actual = select_pd_pair(
+                                        loads, p, d, p_policy, d_policy, &ctx, true,
+                                    )?;
+                                    assert_eq!(
+                                        (actual.prefill.worker_index, actual.decode.worker_index),
+                                        (expected_p, expected_d)
+                                    );
+                                    Some(actual)
+                                })
+                                .unwrap();
+                            attempt.attach_workers(
+                                p[selection.prefill.worker_index].clone(),
+                                d[selection.decode.worker_index].clone(),
+                            );
+                            (sequence, selection, attempt)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect()
+            });
+            let live = manager.snapshot();
+            assert_eq!(
+                live.values()
+                    .map(|load| load.prefill_requests)
+                    .sum::<usize>(),
+                concurrency + 1
+            );
+            assert_eq!(
+                live.values()
+                    .map(|load| load.pending_decode_requests + load.active_decode_requests)
+                    .sum::<usize>(),
+                concurrency + 1
+            );
+            let mut committed = Vec::new();
+            for (sequence, selection, attempt) in admitted {
+                committed.push((sequence, selection));
+                match sequence % 4 {
+                    0 => {
+                        attempt.finish_prefill();
+                        attempt.begin_decode();
+                        attempt.finish_decode();
+                        attempt.release();
+                    }
+                    1 => {
+                        attempt.release();
+                        attempt.release();
+                    }
+                    2 => std::thread::scope(|scope| {
+                        scope.spawn(|| attempt.release());
+                        scope.spawn(|| {
+                            attempt.begin_decode();
+                            attempt.finish_prefill();
+                            attempt.finish_decode();
+                        });
+                    }),
+                    _ => {
+                        attempt.finish_prefill();
+                        attempt.begin_decode();
+                        // Body cancellation releases D even while another attempt clone lives.
+                        let body = attempt.clone().track_body(Body::from("unconsumed stream"));
+                        drop(body);
+                    }
+                }
+                drop(attempt);
+            }
+            assert_eq!(manager.snapshot(), sentinel_loads);
+            assert!(p.iter().chain(&d).all(|worker| worker.load() == 0));
+            assert_eq!((sentinel_p.load(), sentinel_d.load()), (1, 1));
+            // Every unique prompt belongs to exactly the actual worker. Giving
+            // the other worker tie priority exposes any accidental alternative commit.
+            for (sequence, selection) in committed {
+                let ids = tokens(sequence);
+                for (policy, workers, actual) in [
+                    (&p_policy, &p, selection.prefill.worker_index),
+                    (&d_policy, &d, selection.decode.worker_index),
+                ] {
+                    let prepared = pressure_tokens(policy, workers, &ids);
+                    let view = policy.selection_view(workers, Some(&prepared));
+                    assert_eq!(
+                        policy
+                            .evaluate_prepared(&view, &[1 - actual, actual])
+                            .worker_index(),
+                        Some(actual)
+                    );
+                }
+            }
+        }
+        drop(sentinel);
+        assert!(manager.snapshot().is_empty());
+        assert_eq!((sentinel_p.load(), sentinel_d.load()), (0, 0));
+        let rendered = metrics.render();
+        let count = |name: &str, labels: &[&str]| -> f64 {
+            rendered
+                .lines()
+                .filter(|line| {
+                    line.starts_with(name) && labels.iter().all(|label| line.contains(label))
+                })
+                .map(|line| {
+                    line.split_whitespace()
+                        .last()
+                        .unwrap()
+                        .parse::<f64>()
+                        .unwrap()
+                })
+                .sum()
+        };
+        for (stage, workers) in [("prefill", &p), ("decode", &d)] {
+            assert_eq!(
+                workers
+                    .iter()
+                    .map(|worker| worker.processed_requests())
+                    .sum::<usize>(),
+                total
+            );
+            let stage_label = format!("stage=\"{stage}\"");
+            assert_eq!(
+                count(
+                    "vllm_router_prefix_routing_decisions_total",
+                    &[&stage_label]
+                ),
+                total as f64
+            );
+            for name in [
+                "vllm_router_processed_requests_total",
+                "vllm_router_policy_decisions_total",
+            ] {
+                let actual: f64 = workers
+                    .iter()
+                    .map(|worker| count(name, &[&format!("worker=\"{}\"", worker.url())]))
+                    .sum();
+                assert_eq!(
+                    actual, total as f64,
+                    "{stage} {name} committed more than once"
+                );
+            }
+            let enabled = (0..total)
+                .filter(|sequence| {
+                    if stage == "prefill" {
+                        sequence % 4 != 1
+                    } else {
+                        sequence % 4 != 0
+                    }
+                })
+                .count();
+            assert_eq!(
+                count("vllm_router_pd_pressure_decisions_total", &[&stage_label]),
+                enabled as f64
+            );
+        }
+        assert!(
+            count(
+                "vllm_router_pd_pressure_decisions_total",
+                &["reason=\"would_override\""]
+            ) > 0.0
+        );
+        assert_eq!(
+            count(
+                "vllm_router_pd_pressure_decisions_total",
+                &["stage=\"decode\"", "reason=\"unbound_worker\""]
+            ),
+            (total / 4) as f64
+        );
+        println!(
+            "PD_PRESSURE_STRESS_RESULT {}",
+            serde_json::json!({
+                "stage": "pr2", "kind": "pair_shadow", "rounds": rounds, "concurrency": concurrency,
+                "attempts": total, "final_load_entries": manager.snapshot().len(),
+                "sentinel_preserved": true, "shadow_actual_baseline": true,
+                "wall_seconds": started.elapsed().as_secs_f64(),
+                "evidence": "synthetic shadow admission and cleanup, not TTFT",
+            })
+        );
+    }
+
     #[test]
     fn racing_cleanup_never_releases_another_attempt() {
         let manager = Arc::new(PdLoadManager::default());
@@ -3952,6 +4935,7 @@ mod admission_tests {
                 legacy_policy_input: Some("original request"),
                 prefill_cache: None,
                 decode_cache: None,
+                pressure: None,
                 headers: None,
                 affinity_key: None,
                 lora_name: None,

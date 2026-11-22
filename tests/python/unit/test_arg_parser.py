@@ -10,10 +10,43 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from vllm_router.launch_router import RouterArgs, parse_router_args
+from vllm_router.launch_router import RouterArgs, launch_router, parse_router_args
 from vllm_router.router import Router, policy_from_str
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
+
+class TestPdPressureLauncherArgs:
+    def test_default_is_absent(self):
+        assert RouterArgs().pd_pressure_config is None
+        assert parse_router_args([]).pd_pressure_config is None
+
+    @pytest.mark.parametrize("use_prefix", [False, True])
+    def test_json_passes_through_cli_and_native_constructor(self, use_prefix):
+        value = '{"prefill":{"mode":"shadow"},"decode":{"mode":"off"}}'
+        prefix = "router-" if use_prefix else ""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=use_prefix)
+        namespace = parser.parse_args([f"--{prefix}pd-pressure-config", value])
+        args = RouterArgs.from_cli_args(namespace, use_router_prefix=use_prefix)
+        assert args.pd_pressure_config == value
+        with patch("vllm_router.router._Router") as native_router:
+            Router.from_args(args)
+        assert native_router.call_args.kwargs["pd_pressure_config"] == value
+
+    @pytest.mark.parametrize("value", ["{}", '{"prefill":{"mode":"shadow"}}'])
+    def test_mini_lb_rejects_explicit_pressure_configuration(self, value):
+        args = RouterArgs(mini_lb=True, pd_pressure_config=value)
+        with patch("vllm_router.launch_router.MiniLoadBalancer") as mini:
+            with pytest.raises(ValueError, match="unsupported with mini_lb"):
+                launch_router(args)
+        mini.assert_not_called()
+
+    def test_mini_lb_without_pressure_keeps_existing_path(self):
+        with patch("vllm_router.launch_router.MiniLoadBalancer") as mini:
+            launch_router(RouterArgs(mini_lb=True))
+        mini.assert_called_once()
+        mini.return_value.start.assert_called_once()
 
 
 class TestKvLauncherArgs:

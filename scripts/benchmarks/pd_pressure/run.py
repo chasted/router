@@ -23,7 +23,10 @@ STAGES = {
     1: (("admission", ["--lib"], "routers::http::pd_router::admission_tests::pd_cache_aware_pr1_stress"),
         ("http", ["--test", "test_pd_routing"], "test_pd_routing::http_pd_cache_aware_pr1_stress"),
         ("grpc", ["--test", "grpc_pd_routing"], "grpc_pd_cache_aware_pr1_stress")),
-    2: None, 3: None, 4: None,
+    2: (("admission_shadow", ["--lib"], "routers::http::pd_router::admission_tests::pd_cache_aware_pr2_stress"),
+        ("http_shadow", ["--test", "pd_pressure_routing"], "http_pd_pressure_pr2_stress"),
+        ("grpc_shadow", ["--test", "grpc_pd_routing"], "grpc_pd_pressure_pr2_stress")),
+    3: None, 4: None,
 }
 RESULT = re.compile(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed;")
 
@@ -133,18 +136,44 @@ def stress_result(output, suite):
         raise ValueError("expected exactly one PD_PRESSURE_STRESS_RESULT record")
     result = records[0]
     positive = lambda value: type(value) is int and value > 0
+    exact = lambda value, expected: type(value) is int and value == expected
     if not isinstance(result, dict) or not all(positive(result.get(key)) for key in ("rounds", "concurrency")):
         raise ValueError("invalid stress rounds/concurrency")
-    if result.get("attempts" if suite == "admission" else "requests") != result["rounds"] * result["concurrency"]:
-        raise ValueError("stress count must equal rounds * concurrency")
-    if suite == "admission":
-        valid = (result.get("kind") == "pair_admission" and positive(result.get("attempts"))
-                 and result.get("final_load_entries") == 0 and result.get("sentinel_preserved") is True)
+    expected = result["rounds"] * result["concurrency"]
+    admission = suite in ("admission", "admission_shadow")
+    total = expected * (4 if suite == "http_shadow" else 1)
+    if not exact(result.get("attempts" if admission else "requests"), total):
+        raise ValueError("stress count must equal the full requested workload")
+    kinds = {"admission": "pair_admission", "http": "http_pd", "grpc": "grpc_pd",
+             "admission_shadow": "pair_shadow", "http_shadow": "http_pd_shadow",
+             "grpc_shadow": "grpc_pd_shadow"}
+    valid = suite in kinds and result.get("kind") == kinds[suite]
+    if admission:
+        valid = valid and exact(result.get("final_load_entries"), 0) and result.get("sentinel_preserved") is True
     else:
-        valid = (result.get("kind") == {"http": "http_pd", "grpc": "grpc_pd"}.get(suite)
-                 and suite in ("http", "grpc") and positive(result.get("requests"))
-                 and result.get("requests") == result.get("completed") == result.get("handoffs_verified")
-                 and result.get("final_occupancy") == 0)
+        valid = (valid and all(exact(result.get(key), total) for key in ("completed", "handoffs_verified"))
+                 and exact(result.get("final_occupancy"), 0))
+    if suite in ("admission_shadow", "grpc_shadow"):
+        valid = valid and result.get("shadow_actual_baseline") is True
+    if suite == "http_shadow":
+        cases = result.get("cases")
+        expected_modes = {(prefill, decode) for prefill in ("off", "shadow") for decode in ("off", "shadow")}
+        valid = valid and exact(result.get("scenario_count"), 4) and isinstance(cases, list) and len(cases) == 4
+        modes = []
+        if isinstance(cases, list):
+            for case in cases:
+                if not isinstance(case, dict):
+                    valid = False
+                    continue
+                pair = (case.get("prefill"), case.get("decode"))
+                if not all(isinstance(mode, str) for mode in pair):
+                    valid = False
+                    continue
+                modes.append(pair)
+                valid = (valid and all(exact(case.get(key), expected)
+                                      for key in ("requests", "completed", "handoffs_verified"))
+                         and exact(case.get("final_occupancy"), 0))
+        valid = valid and len(modes) == 4 and set(modes) == expected_modes
     seconds = result.get("wall_seconds")
     if not valid or type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0:
         raise ValueError("stress result is incomplete or reports an invariant failure")

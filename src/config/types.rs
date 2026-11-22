@@ -14,6 +14,9 @@ pub struct RouterConfig {
     /// Optional encoder orchestration for E+PD or E/P/D routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epd: Option<EpdConfig>,
+    /// Optional native P/D pressure observation; absent means both stages are off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pd_pressure: Option<crate::kv_pressure::PdPressureConfig>,
     /// Routing mode configuration
     pub mode: RoutingMode,
     /// Statically configured KV event sources, keyed by prefill base URL.
@@ -103,6 +106,23 @@ pub struct RouterConfig {
     /// Optional Program-level admission and continuity scheduling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_scheduling: Option<ProgramSchedulingConfig>,
+}
+
+/// Parse the shared JSON option used by the Rust CLI and Python binding.
+pub fn parse_pd_pressure_config(
+    json: Option<&str>,
+) -> ConfigResult<Option<crate::kv_pressure::PdPressureConfig>> {
+    json.map(|value| {
+        let config: crate::kv_pressure::PdPressureConfig =
+            serde_json::from_str(value).map_err(|error| super::ConfigError::ValidationFailed {
+                reason: format!("Invalid pd_pressure configuration JSON: {error}"),
+            })?;
+        config
+            .validate()
+            .map_err(|reason| super::ConfigError::ValidationFailed { reason })?;
+        Ok(config)
+    })
+    .transpose()
 }
 
 fn default_profile_timeout_secs() -> u64 {
@@ -1448,6 +1468,7 @@ impl Default for RouterConfig {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            pd_pressure: None,
         }
     }
 }
@@ -1514,6 +1535,40 @@ impl RouterConfig {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pd_pressure_json_is_optional_and_round_trips() {
+        let mut config = RouterConfig::default();
+        assert!(config.pd_pressure.is_none());
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(json.get("pd_pressure").is_none());
+        let decoded: RouterConfig = serde_json::from_value(json).unwrap();
+        assert!(decoded.pd_pressure.is_none());
+        assert!(parse_pd_pressure_config(None).unwrap().is_none());
+        config.pd_pressure =
+            parse_pd_pressure_config(Some(r#"{"prefill":{"mode":"shadow"}}"#)).unwrap();
+        let decoded: RouterConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(decoded.pd_pressure, config.pd_pressure);
+        assert!(!parse_pd_pressure_config(Some("{}"))
+            .unwrap()
+            .unwrap()
+            .enabled());
+    }
+
+    #[test]
+    fn pd_pressure_json_rejects_invalid_or_unsupported_values() {
+        for json in [
+            "not json",
+            "null",
+            r#"{"unknown":true}"#,
+            r#"{"prefill":{"mode":"on"}}"#,
+            r#"{"decode":{"mode":"on"}}"#,
+            r#"{"prefill":{"mode":"off","poll_interval_ms":0}}"#,
+        ] {
+            assert!(parse_pd_pressure_config(Some(json)).is_err(), "{json}");
+        }
+    }
 
     // ============= RouterConfig Tests =============
 
@@ -2331,6 +2386,7 @@ mod tests {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            pd_pressure: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -2402,6 +2458,7 @@ mod tests {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            pd_pressure: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -2469,6 +2526,7 @@ mod tests {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            pd_pressure: None,
         };
 
         assert!(config.has_service_discovery());

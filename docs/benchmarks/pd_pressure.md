@@ -18,7 +18,9 @@ established separately. The runner does not infer them from an HTTP URL.
 | PR1 admission | Library `routers::http::pd_router::admission_tests::pd_cache_aware_pr1_stress` | Shared accounting check. |
 | PR1 HTTP P/D | Target `test_pd_routing`, exact filter `test_pd_routing::http_pd_cache_aware_pr1_stress` | Primary routing stress. |
 | PR1 gRPC P/D | Target `grpc_pd_routing`, exact filter `grpc_pd_cache_aware_pr1_stress` | Compatibility stress. |
-| PR2 | Not registered | Exits 3 with `not_implemented`; no success claim. |
+| PR2 admission | Library `routers::http::pd_router::admission_tests::pd_cache_aware_pr2_stress` | Shared shadow/baseline accounting. |
+| PR2 HTTP P/D | Target `pd_pressure_routing`, exact filter `http_pd_pressure_pr2_stress` | Four independent stage-mode combinations. |
+| PR2 gRPC P/D | Target `grpc_pd_routing`, exact filter `grpc_pd_pressure_pr2_stress` | Shadow compatibility and baseline preservation. |
 | PR3 | Not registered | Exits 3 with `not_implemented`; no success claim. |
 | PR4 | Not registered | Exits 3 with `not_implemented`; no success claim. |
 
@@ -90,9 +92,165 @@ than overwriting a retained reference binary. The global Cargo download cache
 may be reused. A 32-core machine with only 8 GiB assigned to WSL should not use
 32 concurrent compiler jobs without a separate memory check.
 
-For later stages, the same command with `--stage 2`, `3`, or `4` currently
+For later stages, the same command with `--stage 3` or `4` currently
 records `not_implemented` and exits 3. That is an incomplete validation result,
 not a skipped success.
+
+### PR2 CPU shadow stress
+
+Use the same stress command with `--stage 2` and a new output directory.
+Each repeat runs `admission_shadow`, `http_shadow`, and `grpc_shadow` with the
+exact ignored filters in the table. With `N = stress_rounds * stress_concurrency`:
+
+- Admission emits `pair_shadow`: exactly N attempts, zero final load entries,
+  preserved sentinel, and `shadow_actual_baseline: true`.
+- HTTP emits `http_pd_shadow`: exactly 4N requests, completions and handoffs;
+  four unique cases covering off/off, shadow/off, off/shadow and shadow/shadow;
+  each case has exactly N requests/completions/handoffs and zero final occupancy.
+- gRPC emits `grpc_pd_shadow`: exactly N requests/completions/handoffs, zero
+  final occupancy, and `shadow_actual_baseline: true`.
+
+The runner rejects incomplete or duplicated cases, incorrect counts, missing
+baseline-preservation assertions, zero tests and missing executable hashes.
+All assertions concern CPU mock routing, observation and lifecycle behavior;
+PR2 keeps actual routing on the baseline and provides no TTFT benefit evidence.
+PR3 and PR4 remain unimplemented runner stages.
+
+### Configure native P/D pressure observation
+
+The Rust CLI and Python launcher accept the same `--pd-pressure-config` JSON
+string; the Python constructor keyword is `pd_pressure_config`. The Rust
+`RouterConfig` JSON field is the structured object `pd_pressure`. Omission
+means both stages are off. Each stage defaults to off independently; PR2 accepts
+only `off` and `shadow`, and rejects `on`; the `on` routing change is not
+implemented. When both are off, no pressure
+collector starts and existing Rust routing modes retain their original path.
+Invalid configuration is rejected even when off. Python MiniLB rejects any
+explicit pressure configuration rather than silently ignoring it.
+
+An enabled stage requires native vLLM P/D mode and that stage's effective
+`cache_aware` policy (stage override, otherwise the global policy). Program
+Scheduling and IGW are unsupported. Enabled pressure also rejects the vLLM ZMQ
+`--vllm-discovery-address` / `discovery_address` path: its candidates are rebuilt
+without the stable registry bindings required by the collector. Omission or
+explicit all-off preserves the existing Rust discovery behavior.
+HTTP P/D is the primary deployment path;
+gRPC shares routing compatibility but still needs an explicit HTTP(S) metrics
+endpoint. Neither an HTTP inference URL nor a gRPC URL establishes the metrics
+address, authentication, identity or metric layout.
+
+Save the following illustrative object as `pd-pressure.json`, replacing the
+addresses, model and expected identity with deployment-verified values:
+
+```json
+{
+  "prefill": {
+    "mode": "shadow",
+    "high": 0.9,
+    "low": 0.8,
+    "mappings": [{
+      "inference_endpoint": "http://prefill:8000",
+      "dp_rank": null,
+      "metrics_url": "http://prefill-exporter:9100/metrics",
+      "usage": {
+        "name": "vllm:kv_cache_usage_perc",
+        "labels": {"engine": "0", "model_name": "my-model"}
+      },
+      "identity": {
+        "name": "router_pd_engine_identity",
+        "labels": {"engine": "0", "model_name": "my-model"}
+      },
+      "expected_engine_id": "prefill-engine-0",
+      "expected_instance_epoch": "pod-start-42",
+      "expected_layout_fingerprint": "layout-v1"
+    }]
+  },
+  "decode": {"mode": "off"}
+}
+```
+
+```bash
+vllm-router --vllm-pd-disaggregation \
+  --prefill http://prefill:8000 --decode http://decode:8000 \
+  --policy cache_aware --pd-pressure-config "$(cat pd-pressure.json)"
+```
+
+`router_pd_engine_identity` is an **example custom exporter contract**, not a
+standard vLLM metric. The deployment must establish that the exporter reads the
+identified live engine and reports its current process generation and KV layout.
+Copying configured strings into an exporter does not establish that identity.
+A native usage gauge with only an `engine` index is insufficient. Without a
+verified identity source the observation is invalid and routing stays on the
+baseline; this feature is not ready to use with unmodified vLLM metrics alone.
+An empty mapping list is allowed for unsupported-signal fallback testing, and
+provides no capacity observation.
+
+One scrape response must contain exactly one usage series selected by its
+configured name/labels, with a finite value in [0, 1], and exactly one selected
+identity series with value **1**. For the example, the relevant response is:
+
+```text
+vllm:kv_cache_usage_perc{engine="0",model_name="my-model"} 0.93
+router_pd_engine_identity{engine="0",model_name="my-model",stage="prefill",endpoint="http://prefill:8000",dp_rank="aggregate",engine_id="prefill-engine-0",instance_epoch="pod-start-42",layout_fingerprint="layout-v1"} 1
+```
+
+The identity labels `stage`, `endpoint`, `dp_rank`, `engine_id`,
+`instance_epoch` and `layout_fingerprint` must equal the mapping. Every usage
+selector label, including `engine` and `model_name`, must also match on identity.
+If the usage series carries any reserved identity label, that label must agree
+as well; an aggregate identity cannot validate a rank-specific usage series.
+For a rank-specific mapping use numeric `dp_rank` in JSON, its decimal string in
+both the usage selector and identity series, and that rank's verified engine
+identity; a null rank uses identity `dp_rank="aggregate"`. Matching labels do not
+prove identity without the deployment verification above.
+
+Missing/duplicate series, nonfinite/out-of-range usage, changed engine epoch or
+layout, authentication errors, oversized responses and timeouts invalidate the
+latest sample; a prior good sample cannot mask a new failure. Freshness and
+cross-worker skew remain bounded. Collection is capped at **500 ms** and age
+at **2 s from scrape start**, including for other consumers of the shared API.
+The defaults are a 1 s poll interval and 1.5 s maximum cross-worker skew;
+deployments can configure stricter limits but cannot relax the common caps.
+Scrape completion time is not the engine's
+source sample time: the latter is unknown unless separately supplied. Optional
+`auth_token_env` names the environment variable holding a bearer token; secrets
+are not embedded in URLs or configuration. The mapping must follow deployment
+changes; the router does not infer a new epoch or layout from a reused address.
+
+### Shared observations and the first consumer
+
+`src/engine_pressure/` owns collection, parsing, engine/rank binding, generation
+fencing, failure invalidation, and freshness. `EnginePressureRuntime::observe`
+returns `PressureObservation::Known(EngineSample)` or `Unknown(reason)` for an
+explicit `EngineKey` and the caller's current worker object. This object check
+prevents a replacement at the same URL from borrowing the previous process's
+sample. The stage snapshot uses the same identity and freshness validation,
+then checks completeness, timing skew and equal KV layout across candidates.
+No policy, affinity, high/low threshold, or request count enters collection.
+
+`src/kv_pressure/` is the native PD adapter. It translates the existing JSON
+configuration to collection settings and keeps the off/shadow controls and
+high/low thresholds. Its first consumer is native HTTP PD `cache_aware` without
+a usable KV event source. A high baseline is `usage >= high` (default 0.85);
+eligible low candidates satisfy `usage <= low` (default 0.70). The policy runs
+its original affinity rule again within that subset. There is no additional
+request-count veto. Shadow records the proposal and commits the baseline only.
+
+This boundary is coordinated with the per-engine, 500 ms / 2 s proposal in
+[PR #585](https://github.com/vllm-project/router/pull/585). This patch does not
+enable that PR's full-engine admission filter or a second collector alongside
+it; the implementations must converge before both are enabled together.
+Shared availability does not enable a `kv_aware` consumer automatically.
+Program Scheduling's router-accounted placement estimate remains unchanged and
+is not presented as measured engine occupancy. Combining affinity/cost policies
+or demonstrating superiority over `kv_aware` requires separate evaluation.
+
+Validation includes policy-free observation API tests, invalid-data and stale
+sample tests, HTTP P/D shadow and failure injection, and per-stage actual
+selection counters. Upstream random ties and deferred Decode commitment remain
+in force: Decode observes pressure at its actual selection point after Prefill
+where the connector uses deferred commitment. Older benchmark results from
+`2fb33999` plus the prototype patches are not results for this revision.
 
 ### Probe the installed vLLM CLI
 
@@ -227,7 +385,7 @@ Run the runner's own tests without any GPU/model/Cargo build:
 python3 -B -m unittest discover -s scripts/benchmarks/pd_pressure/tests -v
 ```
 
-The tests cover all three PR1 suites and their default two-repeat orchestration,
+The tests cover all three PR1 and PR2 suites and their default two-repeat orchestration,
 tiny sample output, command construction, invalid parameters,
 zero/ignored tests, artifact extraction, evidence preservation, unsupported
 forward handling, and unimplemented stages.

@@ -8,8 +8,10 @@ use std::collections::HashMap;
 
 pub mod core;
 pub mod data_connector;
+pub mod engine_pressure;
 pub mod kv_hash;
 pub mod kv_index;
+pub mod kv_pressure;
 pub mod metrics;
 pub mod middleware;
 pub mod otel_http;
@@ -125,6 +127,7 @@ struct Router {
     // Explicit Program-level scheduling feature switch and optional overrides.
     enable_program_scheduling: bool,
     program_scheduling_config_json: Option<String>,
+    pd_pressure_config: Option<String>,
 }
 
 impl Router {
@@ -230,6 +233,7 @@ impl Router {
 
         Ok(config::RouterConfig {
             epd: None,
+            pd_pressure: config::parse_pd_pressure_config(self.pd_pressure_config.as_deref())?,
             mode,
             pd_kv_event_sources: config::parse_pd_kv_events(&self.pd_kv_events)?,
             kv_event_strict_recovery: self.kv_event_strict_recovery,
@@ -387,6 +391,7 @@ impl Router {
         kv_event_block_size = 16,
         kv_event_model = None,
         kv_event_strict_recovery = false,
+        pd_pressure_config = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -465,7 +470,11 @@ impl Router {
         kv_event_block_size: u32,
         kv_event_model: Option<String>,
         kv_event_strict_recovery: bool,
+        pd_pressure_config: Option<String>,
     ) -> PyResult<Self> {
+        config::parse_pd_pressure_config(pd_pressure_config.as_deref()).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {error}"))
+        })?;
         if wasm_middleware_sha256
             .as_deref()
             .map(str::trim)
@@ -557,6 +566,7 @@ impl Router {
             otlp_traces_endpoint,
             kv_connector,
             program_scheduling_config_json,
+            pd_pressure_config,
         })
     }
 

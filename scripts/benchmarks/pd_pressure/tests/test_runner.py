@@ -17,6 +17,20 @@ runner = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runner)
 
 
+def pr2_results():
+    common = {"rounds": 2, "concurrency": 3, "wall_seconds": 0.1}
+    counts = {"requests": 6, "completed": 6, "handoffs_verified": 6, "final_occupancy": 0}
+    return [
+        {**common, "kind": "pair_shadow", "attempts": 6, "final_load_entries": 0,
+         "sentinel_preserved": True, "shadow_actual_baseline": True},
+        {**common, "kind": "http_pd_shadow", "scenario_count": 4, "requests": 24,
+         "completed": 24, "handoffs_verified": 24, "final_occupancy": 0,
+         "cases": [{"prefill": p, "decode": d, **counts}
+                   for p in ("off", "shadow") for d in ("off", "shadow")]},
+        {**common, **counts, "kind": "grpc_pd_shadow", "shadow_actual_baseline": True},
+    ]
+
+
 class CommandsAndResults(unittest.TestCase):
     def test_pr1_cargo_command_has_features_filter_and_artifact_metadata(self):
         command = runner.cargo_command("/tools/cargo", 1)
@@ -37,8 +51,50 @@ class CommandsAndResults(unittest.TestCase):
         self.assertIn("grpc_pd_cache_aware_pr1_stress", integration)
         self.assertNotIn("--release", runner.cargo_command("cargo", 1, profile="test"))
 
+    def test_pr2_registers_exact_shadow_suites(self):
+        expected = [
+            ("--lib", "routers::http::pd_router::admission_tests::pd_cache_aware_pr2_stress"),
+            ("pd_pressure_routing", "http_pd_pressure_pr2_stress"),
+            ("grpc_pd_routing", "grpc_pd_pressure_pr2_stress"),
+        ]
+        for index, (target, test_filter) in enumerate(expected):
+            command = runner.cargo_command("cargo", 2, index)
+            self.assertIn(target, command)
+            self.assertIn(test_filter, command)
+            self.assertIn("--exact", command)
+            self.assertIn("--ignored", command)
+
+    def test_pr2_checks_modes_counts_and_baseline_invariants(self):
+        suites = ("admission_shadow", "http_shadow", "grpc_shadow")
+        for suite, record in zip(suites, pr2_results()):
+            self.assertEqual(runner.stress_result("PD_PRESSURE_STRESS_RESULT " + json.dumps(record), suite), record)
+        for suite, record in zip(suites, pr2_results()):
+            key = "attempts" if suite == "admission_shadow" else "requests"
+            for invalid in (1, 0, record[key] - 1, record[key] + 1, True, float(record[key])):
+                bad = {**record, key: invalid}
+                with self.subTest(suite=suite, invalid=invalid), self.assertRaises(ValueError):
+                    runner.stress_result("PD_PRESSURE_STRESS_RESULT " + json.dumps(bad), suite)
+        for suite, record in zip(suites, pr2_results()):
+            if suite != "http_shadow":
+                for invalid in (False, None, 1):
+                    bad = {**record, "shadow_actual_baseline": invalid}
+                    with self.subTest(suite=suite), self.assertRaises(ValueError):
+                        runner.stress_result("PD_PRESSURE_STRESS_RESULT " + json.dumps(bad), suite)
+        variants = []
+        http = pr2_results()[1]
+        variants.extend([{**http, "cases": http["cases"][:3]}, {**http, "scenario_count": 3},
+                         {**http, "cases": [http["cases"][0]] * 4}])
+        for update in ({"prefill": "on"}, {"decode": None}, {"requests": 5},
+                       {"completed": 5}, {"handoffs_verified": 5}, {"final_occupancy": 1}):
+            cases = [dict(case) for case in http["cases"]]
+            cases[0].update(update)
+            variants.append({**http, "cases": cases})
+        for bad in variants:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                runner.stress_result("PD_PRESSURE_STRESS_RESULT " + json.dumps(bad), "http_shadow")
+
     def test_future_stages_are_not_implemented(self):
-        for stage in (2, 3, 4):
+        for stage in (3, 4):
             with self.subTest(stage=stage), self.assertRaisesRegex(ValueError, "not implemented"):
                 runner.cargo_command("cargo", stage)
 
@@ -184,6 +240,27 @@ class RecordingAndCapabilities(unittest.TestCase):
                 "size_bytes": binary.stat().st_size, "mtime_ns": binary.stat().st_mtime_ns})
             self.assertIn("machine", saved)
 
+    def test_pr2_records_two_repeats_of_all_shadow_suites(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = json.dumps({"reason": "compiler-artifact", "profile": {"test": True},
+                                   "executable": sys.executable})
+            outputs = [(0, artifact + "\nPD_PRESSURE_STRESS_RESULT " + json.dumps(record)
+                        + "\ntest result: ok. 1 passed; 0 failed; 0 ignored;")
+                       for record in pr2_results() * 2]
+            args = ["stress", "--stage", "2", "--repo", tmp, "--out-dir", str(root / "out"),
+                    "--base-ref", "HEAD", "--cargo", sys.executable, "--profile", "test",
+                    "--stress-rounds", "2", "--stress-concurrency", "3"]
+            with mock.patch.object(runner, "provenance"), mock.patch.object(
+                    runner.Recorder, "run", side_effect=outputs) as execute, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main(args), 0)
+            self.assertEqual(execute.call_count, 6)
+            saved = json.loads((root / "out/manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual([item["suite"] for item in saved["stress_results"]],
+                             ["admission_shadow", "http_shadow", "grpc_shadow"] * 2)
+            self.assertEqual(len(list((root / "out").glob("stress-*.result.json"))), 6)
+            self.assertIn(sys.executable, saved["test_binaries"])
+
     def test_provenance_failure_cannot_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(base_ref="HEAD", repo=Path(tmp))
@@ -258,7 +335,7 @@ class RecordingAndCapabilities(unittest.TestCase):
     def test_unimplemented_stage_records_failure_without_invoking_cargo(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(runner.Recorder, "run") as execute:
             with contextlib.redirect_stdout(io.StringIO()):
-                result = runner.main(["stress", "--stage", "2", "--repo", tmp,
+                result = runner.main(["stress", "--stage", "3", "--repo", tmp,
                                       "--out-dir", str(Path(tmp) / "out"), "--base-ref", "HEAD"])
             self.assertEqual(result, 3)
             execute.assert_not_called()

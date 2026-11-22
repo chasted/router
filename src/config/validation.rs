@@ -26,6 +26,7 @@ impl ConfigValidator {
                 }
             );
 
+        Self::validate_pd_pressure(config)?;
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
@@ -50,6 +51,60 @@ impl ConfigValidator {
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
 
+        Ok(())
+    }
+
+    fn validate_pd_pressure(config: &RouterConfig) -> ConfigResult<()> {
+        let Some(pressure) = &config.pd_pressure else {
+            return Ok(());
+        };
+        pressure
+            .validate()
+            .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+        // Explicit all-off configuration preserves every existing Rust routing mode.
+        if !pressure.enabled() {
+            return Ok(());
+        }
+        if config.enable_igw || !matches!(config.mode, RoutingMode::VllmPrefillDecode { .. }) {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "pd_pressure requires native vllm_prefill_decode mode; IGW is unsupported"
+                    .into(),
+            });
+        }
+        if matches!(
+            &config.mode,
+            RoutingMode::VllmPrefillDecode {
+                discovery_address: Some(_),
+                ..
+            }
+        ) {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "pd_pressure does not support discovery_address: stable discovered worker bindings are not implemented".into(),
+            });
+        }
+        if config.program_scheduling.is_some() {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "pd_pressure does not support Program scheduling".into(),
+            });
+        }
+        for (stage, enabled, policy) in [
+            (
+                "prefill",
+                pressure.prefill.enabled(),
+                config.mode.get_prefill_policy(&config.policy),
+            ),
+            (
+                "decode",
+                pressure.decode.enabled(),
+                config.mode.get_decode_policy(&config.policy),
+            ),
+        ] {
+            if enabled && !matches!(policy, PolicyConfig::CacheAware { .. }) {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: format!("pd_pressure.{stage} requires an effective cache_aware policy"),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1057,6 +1112,168 @@ fn base_url_without_rank(url: &str) -> &str {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    fn pressure_test_policy() -> PolicyConfig {
+        PolicyConfig::CacheAware {
+            cache_threshold: 0.3,
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 120,
+            max_tree_size: 1024,
+        }
+    }
+
+    fn pressure_test_config(prefill: bool, decode: bool) -> RouterConfig {
+        let mut config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://p:8000".into(), None)],
+                decode_urls: vec!["http://d:8000".into()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            pressure_test_policy(),
+        );
+        config.pd_pressure = Some(
+            serde_json::from_value(serde_json::json!({
+                "prefill": {"mode": if prefill { "shadow" } else { "off" }},
+                "decode": {"mode": if decode { "shadow" } else { "off" }},
+            }))
+            .unwrap(),
+        );
+        config
+    }
+
+    #[test]
+    fn pd_pressure_checks_effective_policy_only_for_enabled_stages() {
+        for prefill in [true, false] {
+            let mut config = pressure_test_config(prefill, !prefill);
+            assert!(config.validate().is_ok());
+            config.policy = PolicyConfig::Random;
+            assert!(config.validate().is_err());
+            if let RoutingMode::VllmPrefillDecode {
+                prefill_policy,
+                decode_policy,
+                ..
+            } = &mut config.mode
+            {
+                let active = if prefill {
+                    prefill_policy
+                } else {
+                    decode_policy
+                };
+                *active = Some(pressure_test_policy());
+            }
+            // The other stage is off and may retain the non-cache-aware global policy.
+            assert!(config.validate().is_ok());
+            config.policy = pressure_test_policy();
+            if let RoutingMode::VllmPrefillDecode {
+                prefill_policy,
+                decode_policy,
+                ..
+            } = &mut config.mode
+            {
+                let active = if prefill {
+                    prefill_policy
+                } else {
+                    decode_policy
+                };
+                *active = Some(PolicyConfig::RoundRobin);
+            }
+            assert!(config.validate().is_err());
+        }
+        let mut both = pressure_test_config(true, true);
+        both.policy = PolicyConfig::Random;
+        if let RoutingMode::VllmPrefillDecode {
+            prefill_policy,
+            decode_policy,
+            ..
+        } = &mut both.mode
+        {
+            *prefill_policy = Some(pressure_test_policy());
+            *decode_policy = Some(pressure_test_policy());
+        }
+        assert!(both.validate().is_ok());
+    }
+
+    #[test]
+    fn pd_pressure_rejects_non_native_pd_program_and_igw() {
+        let shadow = pressure_test_config(true, false);
+        for mode in [
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            RoutingMode::OpenAI {
+                worker_urls: vec!["http://upstream:8000".into()],
+            },
+        ] {
+            let mut config = shadow.clone();
+            config.mode = mode;
+            assert!(config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("native"));
+        }
+        let mut config = shadow.clone();
+        config.enable_igw = true;
+        assert!(config.validate().unwrap_err().to_string().contains("IGW"));
+        let mut config = shadow;
+        config.program_scheduling = Some(ProgramSchedulingConfig::default());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("Program"));
+    }
+
+    #[test]
+    fn pd_pressure_all_off_preserves_legacy_modes_but_still_validates_body() {
+        let mut config = RouterConfig {
+            pd_pressure: Some(crate::kv_pressure::PdPressureConfig::default()),
+            ..RouterConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        config.enable_igw = true;
+        assert!(config.validate().is_ok());
+        config.enable_igw = false;
+        config.program_scheduling = Some(ProgramSchedulingConfig::default());
+        assert!(config.validate().is_ok());
+        config
+            .pd_pressure
+            .as_mut()
+            .unwrap()
+            .prefill
+            .poll_interval_ms = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn pd_pressure_rejects_unbound_discovery_but_preserves_off_configuration() {
+        for (prefill, decode) in [(true, false), (false, true)] {
+            let mut config = pressure_test_config(prefill, decode);
+            if let RoutingMode::VllmPrefillDecode {
+                prefill_urls,
+                decode_urls,
+                discovery_address,
+                ..
+            } = &mut config.mode
+            {
+                prefill_urls.clear();
+                decode_urls.clear();
+                *discovery_address = Some("0.0.0.0:30001".into());
+            }
+            assert!(config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("discovery_address"));
+            config.pd_pressure = None;
+            assert!(config.validate().is_ok());
+            config.pd_pressure = Some(crate::kv_pressure::PdPressureConfig::default());
+            assert!(config.validate().is_ok());
+        }
+    }
 
     #[test]
     fn session_affinity_ttl_is_optional_and_bounded() {

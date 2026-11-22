@@ -21,6 +21,7 @@ mod rendezvous_hash;
 mod round_robin;
 mod sticky_least_loaded;
 
+pub(crate) use cache_aware::PreparedCacheDecision;
 pub use cache_aware::PreparedCacheSelection;
 pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy};
 pub use consistent_hash::ConsistentHashPolicy;

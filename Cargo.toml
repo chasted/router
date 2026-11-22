@@ -165,6 +165,10 @@ name = "api_endpoints_test"
 path = "tests/rust/api_endpoints_test.rs"
 
 [[test]]
+name = "pd_pressure_routing"
+path = "tests/rust/pd_pressure_routing.rs"
+
+[[test]]
 name = "bench_corpus_test"
 path = "tests/rust/bench_corpus_test.rs"
 

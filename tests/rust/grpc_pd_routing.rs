@@ -280,8 +280,42 @@ async fn grpc_pd_unavailable_pool_rejects_before_request_preparation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run with the PD pressure evaluation script"]
 async fn grpc_pd_cache_aware_pr1_stress() {
+    let (rounds, concurrency) = pd_stress_settings();
+    run_grpc_pd_stress(false, rounds, concurrency).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run with the PD pressure evaluation script"]
+async fn grpc_pd_pressure_pr2_stress() {
+    let (rounds, concurrency) = pd_stress_settings();
+    run_grpc_pd_stress(true, rounds, concurrency).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grpc_pd_pressure_shadow_preserves_baseline_handoff() {
+    run_grpc_pd_stress(true, 1, 4).await;
+}
+
+fn pd_stress_settings() -> (usize, usize) {
+    let setting = |name: &str, default: usize, max: usize| {
+        let value = std::env::var(name)
+            .map(|value| value.parse::<usize>().expect("positive stress setting"))
+            .unwrap_or(default);
+        assert!((1..=max).contains(&value), "{name} must be in 1..={max}");
+        value
+    };
+    (
+        setting("ROUTER_PD_STRESS_ROUNDS", 24, 10_000),
+        setting("ROUTER_PD_STRESS_CONCURRENCY", 16, 256),
+    )
+}
+
+async fn run_grpc_pd_stress(shadow: bool, rounds: usize, concurrency: usize) {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+    // The two stress modes share process-wide policy counters.
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _exclusive = LOCK.lock().await;
 
     fn delta(before: &str, after: &str, name: &str, labels: &[&str]) -> f64 {
         let sum = |text: &str| -> f64 {
@@ -301,15 +335,6 @@ async fn grpc_pd_cache_aware_pr1_stress() {
         sum(after) - sum(before)
     }
 
-    let setting = |name: &str, default: usize, max: usize| {
-        let value = std::env::var(name)
-            .map(|value| value.parse::<usize>().expect("positive stress setting"))
-            .unwrap_or(default);
-        assert!((1..=max).contains(&value), "{name} must be in 1..={max}");
-        value
-    };
-    let rounds = setting("ROUTER_PD_STRESS_ROUNDS", 24, 10_000);
-    let concurrency = setting("ROUTER_PD_STRESS_CONCURRENCY", 16, 256);
     metrics();
     let mut prefills = Vec::new();
     let mut decodes = Vec::new();
@@ -332,6 +357,51 @@ async fn grpc_pd_cache_aware_pr1_stress() {
             .await,
         );
     }
+    let mut metrics_server = None;
+    let pd_pressure = if shadow {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut app = axum::Router::new();
+        let mut stages = serde_json::Map::new();
+        for (stage, prefix, servers) in [("prefill", "p", &prefills), ("decode", "d", &decodes)] {
+            let mut mappings = Vec::new();
+            for (index, server) in servers.iter().enumerate() {
+                let name = format!("{prefix}{index}");
+                let usage = if index == 0 { "0.90" } else { "0.60" };
+                let payload = format!(
+                    "vllm:kv_cache_usage_perc{{engine=\"{name}\",model_name=\"test-model\"}} {usage}\nrouter_kv_identity{{stage=\"{stage}\",endpoint=\"{endpoint}\",dp_rank=\"aggregate\",engine_id=\"{name}\",instance_epoch=\"boot-1\",layout_fingerprint=\"layout-1\",engine=\"{name}\",model_name=\"test-model\"}} 1\n",
+                    endpoint = server.grpc_url,
+                );
+                app = app.route(
+                    &format!("/{name}/metrics"),
+                    axum::routing::get(move || {
+                        let payload = payload.clone();
+                        async move { payload }
+                    }),
+                );
+                mappings.push(json!({
+                    "inference_endpoint": server.grpc_url, "dp_rank": null,
+                    "metrics_url": format!("{base}/{name}/metrics"),
+                    "usage": {"name":"vllm:kv_cache_usage_perc", "labels":{"engine":name,"model_name":"test-model"}},
+                    "identity": {"name":"router_kv_identity", "labels":{"engine":name}},
+                    "expected_engine_id":name, "expected_instance_epoch":"boot-1", "expected_layout_fingerprint":"layout-1",
+                }));
+            }
+            stages.insert(
+                stage.to_owned(),
+                json!({
+                    "mode":"shadow", "poll_interval_ms":10, "timeout_ms":300,
+                    "max_age_ms":2000, "max_skew_ms":2000, "mappings":mappings,
+                }),
+            );
+        }
+        metrics_server = Some(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        Some(serde_json::from_value(Value::Object(stages)).unwrap())
+    } else {
+        None
+    };
     let prefill_urls: Vec<_> = prefills
         .iter()
         .map(|p| (p.grpc_url.clone(), None))
@@ -339,8 +409,8 @@ async fn grpc_pd_cache_aware_pr1_stress() {
     let decode_urls: Vec<_> = decodes.iter().map(|d| d.grpc_url.clone()).collect();
     let policy = PolicyConfig::CacheAware {
         cache_threshold: 0.3,
-        balance_abs_threshold: 2,
-        balance_rel_threshold: 1.1,
+        balance_abs_threshold: if shadow { 100_000 } else { 2 },
+        balance_rel_threshold: if shadow { 100.0 } else { 1.1 },
         eviction_interval_secs: 3600,
         max_tree_size: 1 << 22,
     };
@@ -353,6 +423,7 @@ async fn grpc_pd_cache_aware_pr1_stress() {
             discovery_address: None,
         },
         policy: policy.clone(),
+        pd_pressure,
         kv_connector: KvConnector::Nixl,
         disable_retries: true,
         disable_circuit_breaker: true,
@@ -372,6 +443,45 @@ async fn grpc_pd_cache_aware_pr1_stress() {
             .unwrap(),
     );
     router.pin_test_token_ids((0..128).collect());
+    if shadow {
+        // A cold tie is random upstream. Explicitly warm the intended hot
+        // engine so this stress test measures shadow isolation, not tie luck.
+        let ids: Vec<u32> = (0..128).collect();
+        for (stage, url, policy) in [
+            (
+                "prefill",
+                &prefills[0].grpc_url,
+                ctx.policy_registry.get_prefill_policy(),
+            ),
+            (
+                "decode",
+                &decodes[0].grpc_url,
+                ctx.policy_registry.get_decode_policy(),
+            ),
+        ] {
+            let worker = ctx
+                .worker_registry
+                .get_all()
+                .into_iter()
+                .find(|worker| worker.base_url() == url)
+                .unwrap();
+            let cache = policy
+                .as_any()
+                .downcast_ref::<vllm_router_rs::policies::CacheAwarePolicy>()
+                .unwrap();
+            assert_eq!(
+                cache.select_worker_with_inputs(
+                    &[worker],
+                    vllm_router_rs::policies::KvRequestTokens::Shared(Some(&ids)),
+                    Some("test-model"),
+                    None,
+                    None,
+                    stage,
+                ),
+                Some(0)
+            );
+        }
+    }
     // Seed real prefix affinity before measuring, including for a one-request smoke run.
     let warmup = router.route_chat(None, &chat(false), None).await;
     assert!(warmup.status().is_success(), "{}", warmup.status());
@@ -379,6 +489,35 @@ async fn grpc_pd_cache_aware_pr1_stress() {
         .await
         .unwrap();
     assert!(String::from_utf8_lossy(&bytes).contains("hello from worker"));
+    if shadow {
+        // Readiness requires observed, identity-validated proposals from both
+        // stages, rather than assuming the collector is ready after a delay.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let before = metrics().render();
+                let response = router.route_chat(None, &chat(false), None).await;
+                assert!(response.status().is_success());
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                assert!(String::from_utf8_lossy(&bytes).contains("hello from worker"));
+                let after = metrics().render();
+                if ["prefill", "decode"].iter().all(|stage| {
+                    delta(
+                        &before,
+                        &after,
+                        "vllm_router_pd_pressure_decisions_total",
+                        &[&format!("stage=\"{stage}\""), "reason=\"would_override\""],
+                    ) > 0.0
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("gRPC pressure collector did not produce valid shadow proposals");
+    }
     for server in prefills.iter().chain(&decodes) {
         server.state.captured.lock().unwrap().clear();
     }
@@ -450,7 +589,16 @@ async fn grpc_pd_cache_aware_pr1_stress() {
         .iter()
         .filter(|server| !server.captured().is_empty())
         .count();
-    if concurrency >= 8 && rounds >= 2 {
+    if shadow {
+        assert_eq!(
+            (prefills[0].captured().len(), decodes[0].captured().len()),
+            (expected, expected)
+        );
+        assert!(
+            prefills[1].captured().is_empty() && decodes[1].captured().is_empty(),
+            "shadow dispatched to the proposed worker"
+        );
+    } else if concurrency >= 8 && rounds >= 2 {
         assert_eq!(used_prefills, 2, "stress never dispatched to both prefills");
         assert_eq!(used_decodes, 2, "stress never dispatched to both decodes");
     }
@@ -493,6 +641,30 @@ async fn grpc_pd_cache_aware_pr1_stress() {
             ],
         );
         assert_eq!(missing, 0.0, "{stage} silently used missing-token fallback");
+        if shadow {
+            assert_eq!(
+                hits, expected as f64,
+                "every shadow actual must keep the warm prefix"
+            );
+            assert_eq!(
+                delta(
+                    &before,
+                    &rendered,
+                    "vllm_router_pd_pressure_decisions_total",
+                    &[stage_label.as_str()]
+                ),
+                expected as f64
+            );
+            assert_eq!(
+                delta(
+                    &before,
+                    &rendered,
+                    "vllm_router_pd_pressure_decisions_total",
+                    &[stage_label.as_str(), "reason=\"would_override\""]
+                ),
+                expected as f64
+            );
+        }
         let worker_deltas = |name: &str, policy_label: bool| -> f64 {
             servers
                 .iter()
@@ -551,14 +723,19 @@ async fn grpc_pd_cache_aware_pr1_stress() {
             );
         }
     }
+    assert!(ctx
+        .worker_registry
+        .get_all()
+        .iter()
+        .all(|worker| worker.load() == 0));
     completion_us.sort_by(f64::total_cmp);
     let percentile =
         |percent: usize| completion_us[(completion_us.len() * percent).div_ceil(100) - 1];
     println!(
         "PD_PRESSURE_STRESS_RESULT {}",
         json!({
-            "stage": "pr1",
-            "kind": "grpc_pd",
+            "stage": if shadow { "pr2" } else { "pr1" },
+            "kind": if shadow { "grpc_pd_shadow" } else { "grpc_pd" },
             "rounds": rounds,
             "concurrency": concurrency,
             "requests": expected,
@@ -568,11 +745,15 @@ async fn grpc_pd_cache_aware_pr1_stress() {
             "completion_p50_us": percentile(50),
             "completion_p95_us": percentile(95),
             "final_occupancy": 0,
+            "shadow_actual_baseline": shadow,
             "workers_used": {"prefill": used_prefills, "decode": used_decodes},
             "commit_counts": commit_counts,
             "evidence": "mock gRPC PD handoff, not real-engine TTFT",
         })
     );
+    if let Some(server) = metrics_server {
+        server.abort();
+    }
 }
 
 #[tokio::test]

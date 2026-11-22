@@ -136,6 +136,10 @@ struct CliArgs {
     #[arg(long)]
     program_scheduling_config_json: Option<String>,
 
+    /// Native P/D pressure JSON configuration (off/shadow; on is not supported).
+    #[arg(long)]
+    pd_pressure_config: Option<String>,
+
     /// Enable vLLM PD (Prefill-Decode) disaggregated mode with vLLM-specific two-stage processing
     #[arg(long, default_value_t = false)]
     vllm_pd_disaggregation: bool,
@@ -630,6 +634,9 @@ impl CliArgs {
 
         // Build RouterConfig
         Ok(RouterConfig {
+            pd_pressure: vllm_router_rs::config::parse_pd_pressure_config(
+                self.pd_pressure_config.as_deref(),
+            )?,
             epd: self
                 .epd_config
                 .as_deref()
@@ -862,6 +869,38 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_optional_pd_pressure_json_and_rejects_invalid_config() {
+        let args = CliArgs::try_parse_from(["vllm-router", "--worker-urls", "http://worker:8000"])
+            .unwrap();
+        assert!(args.to_router_config(vec![]).unwrap().pd_pressure.is_none());
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--vllm-pd-disaggregation",
+            "--decode",
+            "http://d:8000",
+            "--pd-pressure-config",
+            r#"{"prefill":{"mode":"shadow"}}"#,
+        ])
+        .unwrap();
+        let config = args
+            .to_router_config(vec![("http://p:8000".into(), None)])
+            .unwrap();
+        assert!(config.pd_pressure.as_ref().unwrap().prefill.enabled());
+        assert!(config.validate().is_ok());
+        for value in ["bad JSON", r#"{"decode":{"mode":"on"}}"#] {
+            let args = CliArgs::try_parse_from([
+                "vllm-router",
+                "--worker-urls",
+                "http://worker:8000",
+                "--pd-pressure-config",
+                value,
+            ])
+            .unwrap();
+            assert!(args.to_router_config(vec![]).is_err());
+        }
+    }
 
     #[test]
     fn parses_pd_kv_aware_with_affinity_ttl() {

@@ -177,6 +177,8 @@ pub struct PdPrefillInput {
 /// Token inputs are keyed by the P base URL: each backend renders its own
 /// effective input, so different tokenizer/template configurations never mix.
 pub struct PdRequestContext<'a> {
+    /// Optional stage-specific pressure observations; selection performs no I/O.
+    pub(crate) pressure: Option<&'a crate::kv_pressure::KvPressureRuntime>,
     pub prefill_inputs: Option<&'a HashMap<String, PdPrefillInput>>,
     pub model_id: Option<&'a str>,
     pub legacy_policy_input: Option<&'a str>,

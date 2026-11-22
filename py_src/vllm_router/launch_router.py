@@ -1,7 +1,7 @@
 import argparse
 import logging
 import sys
-from typing import List, Optional
+from typing import List
 
 import setproctitle
 from vllm_router.mini_lb import MiniLoadBalancer
@@ -10,7 +10,9 @@ from vllm_router.router_args import RouterArgs
 logger = logging.getLogger("router")
 
 try:
-    from vllm_router.router import Router
+    from vllm_router.router import Router as _Router
+
+    Router: type[_Router] | None = _Router
 except ImportError:
     Router = None
     logger.warning(
@@ -18,7 +20,7 @@ except ImportError:
     )
 
 
-def launch_router(args: argparse.Namespace) -> Optional[Router]:
+def launch_router(args: argparse.Namespace | RouterArgs) -> None:
     """
     Launch the VLLM router with the configuration from parsed arguments.
 
@@ -26,8 +28,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
         args: Namespace object containing router configuration
             Can be either raw argparse.Namespace or converted RouterArgs
 
-    Returns:
-        Router instance if successful, None if failed
+    Runs the selected server until it stops. Startup failures are raised.
     """
     setproctitle.setproctitle("vllm::router")
     try:
@@ -38,6 +39,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             router_args = args
 
         if router_args.mini_lb:
+            if router_args.pd_pressure_config is not None:
+                raise ValueError("pd_pressure_config is unsupported with mini_lb")
             mini_lb = MiniLoadBalancer(router_args)
             mini_lb.start()
         else:

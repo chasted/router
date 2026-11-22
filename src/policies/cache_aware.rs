@@ -73,6 +73,7 @@ use crate::protocols::spec::cache_routing;
 use crate::tree::{PrefixMatchResult, Tree};
 use dashmap::DashMap;
 use rand::{Rng, SeedableRng};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
@@ -121,7 +122,7 @@ impl PreparedCacheSelectionView<'_> {
 
 /// An evaluated choice has no effects until the caller commits the actual one.
 pub(crate) struct PreparedCacheDecision<'a> {
-    target: Option<PreparedCacheTarget<'a>>,
+    target: Option<PreparedCacheTarget>,
     min_load: usize,
     max_load: usize,
     imbalanced: bool,
@@ -133,16 +134,38 @@ impl PreparedCacheDecision<'_> {
     pub(crate) fn worker_index(&self) -> Option<usize> {
         self.target.as_ref().map(|target| target.index)
     }
+
+    /// Preparation can exist while an eligible worker still lacks token input.
+    pub(crate) fn has_complete_token_inputs(&self) -> bool {
+        self.cache_update.is_some()
+    }
+
+    /// Retain this exact decision beyond its temporary worker view and inputs.
+    /// Only the actual choice needs owned keys; discarded evaluations borrow them.
+    pub(crate) fn into_owned(self) -> PreparedCacheDecision<'static> {
+        PreparedCacheDecision {
+            target: self.target,
+            min_load: self.min_load,
+            max_load: self.max_load,
+            imbalanced: self.imbalanced,
+            outcome: self.outcome,
+            cache_update: self.cache_update.map(|update| PreparedCacheUpdate {
+                tree: update.tree,
+                keys: Cow::Owned(update.keys.into_owned()),
+                match_rate: update.match_rate,
+            }),
+        }
+    }
 }
 
-struct PreparedCacheTarget<'a> {
+struct PreparedCacheTarget {
     index: usize,
-    worker: &'a dyn Worker,
+    worker: Arc<dyn Worker>,
 }
 
 struct PreparedCacheUpdate<'a> {
-    tree: &'a Tree,
-    keys: &'a [Arc<str>],
+    tree: Arc<Tree>,
+    keys: Cow<'a, [Arc<str>]>,
     match_rate: f64,
 }
 
@@ -478,7 +501,7 @@ impl CacheAwarePolicy {
             )
             .map(|index| PreparedCacheTarget {
                 index,
-                worker: workers[index].as_ref(),
+                worker: Arc::clone(&workers[index]),
             });
             return decision;
         };
@@ -497,7 +520,7 @@ impl CacheAwarePolicy {
         };
         decision.target = Some(PreparedCacheTarget {
             index: candidates[position],
-            worker: workers[candidates[position]].as_ref(),
+            worker: Arc::clone(&workers[candidates[position]]),
         });
         decision.outcome = Some(if imbalanced {
             "load_imbalance"
@@ -507,8 +530,8 @@ impl CacheAwarePolicy {
             "prefix_miss"
         });
         decision.cache_update = Some(PreparedCacheUpdate {
-            tree: prepared.tree.as_ref(),
-            keys: &matches[position].0,
+            tree: Arc::clone(&prepared.tree),
+            keys: Cow::Borrowed(&matches[position].0),
             match_rate: matches[position].1,
         });
         decision
@@ -525,7 +548,7 @@ impl CacheAwarePolicy {
             RouterMetrics::set_load_range(decision.max_load, decision.min_load);
         }
         if let (Some(target), Some(update)) = (&decision.target, &decision.cache_update) {
-            for key in update.keys {
+            for key in update.keys.iter() {
                 update.tree.insert(key, target.worker.url());
             }
         }
@@ -543,7 +566,7 @@ impl CacheAwarePolicy {
                 "Cache prefix decision"
             );
         }
-        Self::record_worker_selection(target.worker);
+        Self::record_worker_selection(target.worker.as_ref());
         Some(index)
     }
 
@@ -1153,6 +1176,54 @@ mod tests {
         assert!(workers
             .iter()
             .all(|worker| worker.processed_requests() == 1));
+    }
+
+    #[test]
+    fn owned_prepared_commit_survives_view_and_input_lifetimes() {
+        let (policy, workers) = cache_fixture(2, CacheAwareConfig::default());
+        let (ticket, tree, key) = {
+            let projected = vec![workers[1].clone(), workers[0].clone()];
+            let ids = [1, 2, 3, 4];
+            let prepared = policy
+                .prepare_selection(
+                    &projected,
+                    KvRequestTokens::Shared(Some(&ids)),
+                    Some("owned-model"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let view = policy.selection_view(&projected, Some(&prepared));
+            let ticket = policy.evaluate_prepared(&view, &[0]).into_owned();
+            let discarded = policy.evaluate_prepared(&view, &[1]).into_owned();
+            drop(discarded);
+            (
+                ticket,
+                prepared.tree.clone(),
+                prepared.candidates[workers[1].url()].0[0].clone(),
+            )
+        };
+        // The local worker order and prepared keys no longer exist. Committing
+        // must still update only the original worker, not index 0 of a new view.
+        assert_eq!(ticket.worker_index(), Some(0));
+        assert!(workers
+            .iter()
+            .all(|worker| worker.processed_requests() == 0));
+        assert_eq!(
+            tree.prefix_match_tenant_char_count(&key, workers[1].url()),
+            0
+        );
+        assert_eq!(policy.commit_prepared(ticket, "prefill"), Some(0));
+        assert_eq!(workers[0].processed_requests(), 0);
+        assert_eq!(workers[1].processed_requests(), 1);
+        assert_eq!(
+            tree.prefix_match_tenant_char_count(&key, workers[0].url()),
+            0
+        );
+        assert_eq!(
+            tree.prefix_match_tenant_char_count(&key, workers[1].url()),
+            key.chars().count()
+        );
     }
 
     #[test]

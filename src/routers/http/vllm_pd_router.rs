@@ -84,6 +84,8 @@ fn program_unavailable(
 /// vLLM PD Router that extends PdRouterBase with vLLM-specific request handling
 #[derive(Debug)]
 pub struct VllmPDRouter {
+    /// Native P/D shadow telemetry, owned and cancelled with this router.
+    pressure: Option<Arc<crate::kv_pressure::KvPressureRuntime>>,
     epd: Option<super::epd::EncoderStage>,
     /// Underlying PD router for most functionality
     pd_router: PdRouterBase,
@@ -1237,6 +1239,7 @@ impl VllmPDRouter {
         // cache matches can be recomputed against the tree at dispatch.
         let decode_cache = decode_cache.map(Arc::new);
         let context = PdRequestContext {
+            pressure: self.pressure.as_deref(),
             prefill_inputs: prefill_inputs.as_ref(),
             model_id,
             legacy_policy_input: text.as_deref(),
@@ -1429,6 +1432,7 @@ impl VllmPDRouter {
             model_id: input.model_id.as_deref(),
             legacy_policy_input: None,
             prefill_cache: None,
+            pressure: self.pressure.as_deref(),
             decode_cache: decode_cache.as_ref(),
             headers: None,
             affinity_key: input.affinity_key.clone(),
@@ -3116,6 +3120,10 @@ impl VllmPDRouter {
         discovery_address: Option<String>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
+        if ctx.router_config.pd_pressure.is_some() {
+            crate::config::ConfigValidator::validate(&ctx.router_config)
+                .map_err(|error| error.to_string())?;
+        }
         let kv_connector = ctx.router_config.kv_connector;
         // Carries the configured request/connect timeouts; a bare
         // reqwest::Client::new() would let a stalled encoder hold the
@@ -3149,8 +3157,10 @@ impl VllmPDRouter {
             // The Program runtime observes the same registry the request path reads.
             let service_registry = Arc::new(service_registry);
             let program_runtime = PdProgramRuntime::new(ctx, service_registry.clone(), true)?;
+            let pressure = Self::start_pressure(ctx, &pd_router)?;
 
             Ok(Self {
+                pressure,
                 epd: ctx
                     .router_config
                     .epd
@@ -3270,7 +3280,9 @@ impl VllmPDRouter {
                     .await;
             }
 
+            let pressure = Self::start_pressure(ctx, &pd_router)?;
             Ok(Self {
+                pressure,
                 epd: ctx
                     .router_config
                     .epd
@@ -3292,6 +3304,29 @@ impl VllmPDRouter {
                 grpc_frontend,
             })
         }
+    }
+
+    fn start_pressure(
+        ctx: &crate::server::AppContext,
+        pd_router: &PdRouterBase,
+    ) -> Result<Option<Arc<crate::kv_pressure::KvPressureRuntime>>, String> {
+        let Some(config) = ctx
+            .router_config
+            .pd_pressure
+            .as_ref()
+            .filter(|config| config.enabled())
+        else {
+            return Ok(None);
+        };
+        // Metrics endpoints have their own explicit authentication. Do not
+        // inherit inference credentials or follow redirects to another host.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| "cannot create P/D pressure metrics client".to_owned())?;
+        let pressure = crate::kv_pressure::KvPressureRuntime::new(config.clone(), client)?;
+        pressure.start(pd_router.worker_registry.clone());
+        Ok(Some(pressure))
     }
 
     /// Add a prefill server to the router
@@ -3348,6 +3383,14 @@ impl VllmPDRouter {
             self.grpc_frontend.tokenizer_cache_stats(),
             self.grpc_frontend.l1_cache_stats(),
         )
+    }
+}
+
+impl Drop for VllmPDRouter {
+    fn drop(&mut self) {
+        if let Some(pressure) = &self.pressure {
+            pressure.shutdown();
+        }
     }
 }
 
