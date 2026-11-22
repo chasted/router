@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record reproducible CPU stress or explicit vLLM benchmarks; never launch servers."""
+"""Record CPU stress and explicit benchmarks; PR3 manages only declared processes."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -20,13 +21,34 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 STAGES = {
-    1: (("admission", ["--lib"], "routers::http::pd_router::admission_tests::pd_cache_aware_pr1_stress"),
-        ("http", ["--test", "test_pd_routing"], "test_pd_routing::http_pd_cache_aware_pr1_stress"),
-        ("grpc", ["--test", "grpc_pd_routing"], "grpc_pd_cache_aware_pr1_stress")),
-    2: (("admission_shadow", ["--lib"], "routers::http::pd_router::admission_tests::pd_cache_aware_pr2_stress"),
-        ("http_shadow", ["--test", "pd_pressure_routing"], "http_pd_pressure_pr2_stress"),
-        ("grpc_shadow", ["--test", "grpc_pd_routing"], "grpc_pd_pressure_pr2_stress")),
-    3: None, 4: None,
+    1: (
+        (
+            "admission",
+            ["--lib"],
+            "routers::http::pd_router::admission_tests::pd_cache_aware_pr1_stress",
+        ),
+        (
+            "http",
+            ["--test", "test_pd_routing"],
+            "test_pd_routing::http_pd_cache_aware_pr1_stress",
+        ),
+        ("grpc", ["--test", "grpc_pd_routing"], "grpc_pd_cache_aware_pr1_stress"),
+    ),
+    2: (
+        (
+            "admission_shadow",
+            ["--lib"],
+            "routers::http::pd_router::admission_tests::pd_cache_aware_pr2_stress",
+        ),
+        (
+            "http_shadow",
+            ["--test", "pd_pressure_routing"],
+            "http_pd_pressure_pr2_stress",
+        ),
+        ("grpc_shadow", ["--test", "grpc_pd_routing"], "grpc_pd_pressure_pr2_stress"),
+    ),
+    3: None,
+    4: None,
 }
 RESULT = re.compile(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed;")
 
@@ -36,12 +58,25 @@ def utc_now():
 
 
 def machine_fingerprint():
-    data = {"cpu_model": None, "visible_logical_cpus": os.cpu_count(), "memory_bytes": None}
+    data = {
+        "cpu_model": None,
+        "visible_logical_cpus": os.cpu_count(),
+        "memory_bytes": None,
+    }
     if sys.platform.startswith("linux"):
         try:
-            fields = (line.partition(":") for line in Path("/proc/cpuinfo").read_text().splitlines())
-            data["cpu_model"] = next((value.strip() for key, _, value in fields
-                                      if key.strip() in ("model name", "Hardware")), None)
+            fields = (
+                line.partition(":")
+                for line in Path("/proc/cpuinfo").read_text().splitlines()
+            )
+            data["cpu_model"] = next(
+                (
+                    value.strip()
+                    for key, _, value in fields
+                    if key.strip() in ("model name", "Hardware")
+                ),
+                None,
+            )
         except OSError:
             pass
         try:
@@ -49,7 +84,9 @@ def machine_fingerprint():
         except (AttributeError, OSError):
             pass
         try:
-            pages, page_size = (os.sysconf(key) for key in ("SC_PHYS_PAGES", "SC_PAGE_SIZE"))
+            pages, page_size = (
+                os.sysconf(key) for key in ("SC_PHYS_PAGES", "SC_PAGE_SIZE")
+            )
             if pages > 0 and page_size > 0:
                 data["memory_bytes"] = pages * page_size
         except (AttributeError, OSError, ValueError):
@@ -90,7 +127,9 @@ def base_url(value):
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise argparse.ArgumentTypeError("expected an explicit http(s) router URL")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise argparse.ArgumentTypeError("URL must not contain credentials, query, or fragment")
+        raise argparse.ArgumentTypeError(
+            "URL must not contain credentials, query, or fragment"
+        )
     try:
         parsed.port
     except ValueError as exc:
@@ -102,9 +141,22 @@ def cargo_command(executable, stage, suite=0, profile="release"):
     if STAGES[stage] is None:
         raise ValueError(f"PR{stage} stress test is not implemented")
     _, target, test_filter = STAGES[stage][suite]
-    return [executable, "test", "--locked", *(["--release"] if profile == "release" else []), "--features", "cpu,ready",
-            *target, "--message-format=json", test_filter, "--", "--ignored", "--exact",
-            "--nocapture", "--test-threads=1"]
+    return [
+        executable,
+        "test",
+        "--locked",
+        *(["--release"] if profile == "release" else []),
+        "--features",
+        "cpu,ready",
+        *target,
+        "--message-format=json",
+        test_filter,
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+    ]
 
 
 def cargo_verdict(returncode, output):
@@ -113,7 +165,11 @@ def cargo_verdict(returncode, output):
         return "failed"
     if not summaries or sum(int(passed) for _, passed, _ in summaries) == 0:
         return "zero_tests"
-    return "passed" if all(kind == "ok" and int(failed) == 0 for kind, _, failed in summaries) else "failed"
+    return (
+        "passed"
+        if all(kind == "ok" and int(failed) == 0 for kind, _, failed in summaries)
+        else "failed"
+    )
 
 
 def test_artifacts(output):
@@ -131,34 +187,69 @@ def test_artifacts(output):
 
 def stress_result(output, suite):
     marker = "PD_PRESSURE_STRESS_RESULT "
-    records = [json.loads(line.split(marker, 1)[1]) for line in output.splitlines() if marker in line]
+    records = [
+        json.loads(line.split(marker, 1)[1])
+        for line in output.splitlines()
+        if marker in line
+    ]
     if len(records) != 1:
         raise ValueError("expected exactly one PD_PRESSURE_STRESS_RESULT record")
     result = records[0]
-    positive = lambda value: type(value) is int and value > 0
-    exact = lambda value, expected: type(value) is int and value == expected
-    if not isinstance(result, dict) or not all(positive(result.get(key)) for key in ("rounds", "concurrency")):
+
+    def positive(value):
+        return type(value) is int and value > 0
+
+    def exact(value, expected):
+        return type(value) is int and value == expected
+
+    if not isinstance(result, dict) or not all(
+        positive(result.get(key)) for key in ("rounds", "concurrency")
+    ):
         raise ValueError("invalid stress rounds/concurrency")
     expected = result["rounds"] * result["concurrency"]
     admission = suite in ("admission", "admission_shadow")
     total = expected * (4 if suite == "http_shadow" else 1)
     if not exact(result.get("attempts" if admission else "requests"), total):
         raise ValueError("stress count must equal the full requested workload")
-    kinds = {"admission": "pair_admission", "http": "http_pd", "grpc": "grpc_pd",
-             "admission_shadow": "pair_shadow", "http_shadow": "http_pd_shadow",
-             "grpc_shadow": "grpc_pd_shadow"}
+    kinds = {
+        "admission": "pair_admission",
+        "http": "http_pd",
+        "grpc": "grpc_pd",
+        "admission_shadow": "pair_shadow",
+        "http_shadow": "http_pd_shadow",
+        "grpc_shadow": "grpc_pd_shadow",
+    }
     valid = suite in kinds and result.get("kind") == kinds[suite]
     if admission:
-        valid = valid and exact(result.get("final_load_entries"), 0) and result.get("sentinel_preserved") is True
+        valid = (
+            valid
+            and exact(result.get("final_load_entries"), 0)
+            and result.get("sentinel_preserved") is True
+        )
     else:
-        valid = (valid and all(exact(result.get(key), total) for key in ("completed", "handoffs_verified"))
-                 and exact(result.get("final_occupancy"), 0))
+        valid = (
+            valid
+            and all(
+                exact(result.get(key), total)
+                for key in ("completed", "handoffs_verified")
+            )
+            and exact(result.get("final_occupancy"), 0)
+        )
     if suite in ("admission_shadow", "grpc_shadow"):
         valid = valid and result.get("shadow_actual_baseline") is True
     if suite == "http_shadow":
         cases = result.get("cases")
-        expected_modes = {(prefill, decode) for prefill in ("off", "shadow") for decode in ("off", "shadow")}
-        valid = valid and exact(result.get("scenario_count"), 4) and isinstance(cases, list) and len(cases) == 4
+        expected_modes = {
+            (prefill, decode)
+            for prefill in ("off", "shadow")
+            for decode in ("off", "shadow")
+        }
+        valid = (
+            valid
+            and exact(result.get("scenario_count"), 4)
+            and isinstance(cases, list)
+            and len(cases) == 4
+        )
         modes = []
         if isinstance(cases, list):
             for case in cases:
@@ -170,55 +261,117 @@ def stress_result(output, suite):
                     valid = False
                     continue
                 modes.append(pair)
-                valid = (valid and all(exact(case.get(key), expected)
-                                      for key in ("requests", "completed", "handoffs_verified"))
-                         and exact(case.get("final_occupancy"), 0))
+                valid = (
+                    valid
+                    and all(
+                        exact(case.get(key), expected)
+                        for key in ("requests", "completed", "handoffs_verified")
+                    )
+                    and exact(case.get("final_occupancy"), 0)
+                )
         valid = valid and len(modes) == 4 and set(modes) == expected_modes
     seconds = result.get("wall_seconds")
-    if not valid or type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0:
+    if (
+        not valid
+        or type(seconds) not in (int, float)
+        or not math.isfinite(seconds)
+        or seconds < 0
+    ):
         raise ValueError("stress result is incomplete or reports an invariant failure")
     return result
 
 
 def serve_command(args, url, result_dir, seed):
-    return [args.vllm, "bench", "serve", "--backend", "openai-chat",
-            "--endpoint", "/v1/chat/completions", "--base-url", url,
-            "--model", args.model, "--dataset-name", "random",
-            "--random-input-len", str(args.input_len),
-            "--random-output-len", str(args.output_len),
-            "--num-prompts", str(args.num_prompts), "--request-rate", str(args.request_rate),
-            "--percentile-metrics", "ttft,tpot,itl,e2el", "--metric-percentiles", "50,95,99",
-            "--seed", str(seed), "--save-result", "--save-detailed", "--result-dir", str(result_dir),
-            "--result-filename", "metrics.json"]
+    return [
+        args.vllm,
+        "bench",
+        "serve",
+        "--backend",
+        "openai-chat",
+        "--endpoint",
+        "/v1/chat/completions",
+        "--base-url",
+        url,
+        "--model",
+        args.model,
+        "--dataset-name",
+        "random",
+        "--random-input-len",
+        str(args.input_len),
+        "--random-output-len",
+        str(args.output_len),
+        "--num-prompts",
+        str(args.num_prompts),
+        "--request-rate",
+        str(args.request_rate),
+        "--percentile-metrics",
+        "ttft,tpot,itl,e2el",
+        "--metric-percentiles",
+        "50,95,99",
+        "--seed",
+        str(seed),
+        "--save-result",
+        "--save-detailed",
+        "--result-dir",
+        str(result_dir),
+        "--result-filename",
+        "metrics.json",
+    ]
 
 
 class Recorder:
     def __init__(self, directory, repo, timeout):
         self.directory, self.repo, self.timeout = directory, repo, timeout
         directory.mkdir(parents=True, exist_ok=False)
-        self.data = {"started_at": utc_now(), "status": "running", "commands": [],
-                     "runner_argv": sys.argv, "python": sys.version,
-                     "platform": platform.platform(), "machine": machine_fingerprint(), "repo": str(repo),
-                     "environment": {key: os.environ.get(key) for key in
-                                     ("CARGO_TARGET_DIR", "CARGO_BUILD_JOBS", "RUSTUP_TOOLCHAIN",
-                                      "CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG", "CARGO_INCREMENTAL")}}
+        self.data = {
+            "started_at": utc_now(),
+            "status": "running",
+            "commands": [],
+            "runner_argv": sys.argv,
+            "python": sys.version,
+            "platform": platform.platform(),
+            "machine": machine_fingerprint(),
+            "repo": str(repo),
+            "environment": {
+                key: os.environ.get(key)
+                for key in (
+                    "CARGO_TARGET_DIR",
+                    "CARGO_BUILD_JOBS",
+                    "RUSTUP_TOOLCHAIN",
+                    "CARGO_PROFILE_DEV_DEBUG",
+                    "CARGO_PROFILE_TEST_DEBUG",
+                    "CARGO_INCREMENTAL",
+                )
+            },
+        }
         self.save()
 
     def save(self):
         (self.directory / "manifest.json").write_text(
-            json.dumps(self.data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            json.dumps(self.data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
 
     def run(self, name, argv, timeout=None, env_updates=None):
-        record = {"name": name, "argv": argv, "cwd": str(self.repo), "started_at": utc_now()}
+        record = {
+            "name": name,
+            "argv": argv,
+            "cwd": str(self.repo),
+            "started_at": utc_now(),
+        }
         record["environment_overrides"] = env_updates or {}
         log = self.directory / f"{len(self.data['commands']):02d}-{name}.log"
         record["raw_output"] = log.name
         started = time.monotonic()
         try:
             with log.open("wb") as stream:
-                proc = subprocess.Popen(argv, cwd=self.repo, stdout=stream, stderr=subprocess.STDOUT,
-                                        start_new_session=(os.name == "posix"),
-                                        env={**os.environ, **(env_updates or {})})
+                proc = subprocess.Popen(
+                    argv,
+                    cwd=self.repo,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=(os.name == "posix"),
+                    env={**os.environ, **(env_updates or {})},
+                )
                 try:
                     code = proc.wait(timeout=timeout or self.timeout)
                 except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
@@ -230,23 +383,55 @@ class Recorder:
                         except ProcessLookupError:
                             pass
                     else:
-                        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                        subprocess.run(
+                            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                        )
                     proc.wait()
                     code = 124 if record["timed_out"] else 130
         except OSError as exc:
             log.write_text(str(exc) + "\n", encoding="utf-8")
             code = 127
-        record.update(returncode=code, elapsed_seconds=time.monotonic() - started, ended_at=utc_now())
+        record.update(
+            returncode=code,
+            elapsed_seconds=time.monotonic() - started,
+            ended_at=utc_now(),
+        )
         self.data["commands"].append(record)
         self.save()
         return code, log.read_text(encoding="utf-8", errors="replace")
 
     def finish(self, status, code, detail=None):
-        self.data.update(status=status, exit_code=code, ended_at=utc_now(), detail=detail)
+        self.data.update(
+            status=status, exit_code=code, ended_at=utc_now(), detail=detail
+        )
+        commands = list(self.data["commands"])
+        for round_record in self.data.get("rounds", []):
+            commands.extend(round_record.get("processes", []))
+        lines = [
+            "# Observed commands; this is an audit log, not a shell replay script."
+        ]
+        for command in sorted(commands, key=lambda item: item.get("started_at", "")):
+            lines += [
+                "# " + command.get("started_at", "unknown time"),
+                shlex.join(command["argv"]),
+            ]
+        (self.directory / "commands.txt").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
         self.save()
-        print(json.dumps({"status": status, "manifest": str(self.directory / "manifest.json"),
-                          "detail": detail}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {
+                    "status": status,
+                    "manifest": str(self.directory / "manifest.json"),
+                    "detail": detail,
+                },
+                ensure_ascii=False,
+            )
+        )
         return code
 
 
@@ -259,21 +444,43 @@ def resolve_executable(value):
 
 def provenance(recorder, args):
     git = ["git", "-c", "core.autocrlf=true"]
+
     def required(name, command, timeout=30):
         code, output = recorder.run(name, command, timeout)
         if code:
-            raise ValueError(f"required provenance command failed: {name} (exit {code})")
+            raise ValueError(
+                f"required provenance command failed: {name} (exit {code})"
+            )
         return output
 
     for label, ref in (("base", args.base_ref), ("head", "HEAD")):
-        output = required(f"git-{label}", [*git, "rev-parse", "--verify", f"{ref}^{{commit}}"])
+        output = required(
+            f"git-{label}", [*git, "rev-parse", "--verify", f"{ref}^{{commit}}"]
+        )
         recorder.data[f"{label}_revision"] = output.strip()
-    dirty = required("git-status", [*git, "status", "--porcelain", "--untracked-files=normal"])
+    dirty = required(
+        "git-status", [*git, "status", "--porcelain", "--untracked-files=normal"]
+    )
     recorder.data["working_tree_dirty"] = bool(dirty.strip())
     required("source-patch", [*git, "diff", "--binary", "HEAD"])
-    untracked = required("untracked-sources", [*git, "ls-files", "--others", "--exclude-standard", "-z", "--",
-                         "src", "tests", "scripts/benchmarks/pd_pressure", "docs/benchmarks/pd_pressure.md",
-                         "Cargo.toml", "Cargo.lock", "build.rs"])
+    untracked = required(
+        "untracked-sources",
+        [
+            *git,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            "src",
+            "tests",
+            "scripts/benchmarks/pd_pressure",
+            "docs/benchmarks/pd_pressure.md",
+            "Cargo.toml",
+            "Cargo.lock",
+            "build.rs",
+        ],
+    )
     recorder.data["untracked_source_sha256"] = {}
     for relative in filter(None, untracked.split("\0")):
         source = (args.repo / relative).resolve()
@@ -284,45 +491,83 @@ def provenance(recorder, args):
         shutil.copyfile(source, destination)
         recorder.data["untracked_source_sha256"][relative] = sha256(destination)
     recorder.data["runner_sha256"] = sha256(__file__)
-    executable = args.cargo if args.action == "stress" else args.vllm
+    python_action = args.action in ("experiment", "report") or (
+        args.action == "stress" and getattr(args, "stage", 1) == 3
+    )
+    executable = (
+        sys.executable
+        if python_action
+        else (args.cargo if args.action == "stress" else args.vllm)
+    )
     recorder.data["tool_executable"] = executable
     recorder.data["tool_sha256"] = sha256(executable)
     required("tool-version", [executable, "--version"], 60)
-    if args.action == "stress":
+    if args.action == "stress" and getattr(args, "stage", 1) in (1, 2):
         required("rustc-version", ["rustc", "--version", "--verbose"])
     if args.action == "serve":
         recorder.data["endpoint_binary_mapping"] = {
-            arm: {"url": getattr(args, arm + "_url"), "binary": str(getattr(args, arm + "_binary")),
-                  "sha256": sha256(getattr(args, arm + "_binary"))}
-            for arm in ("baseline", "candidate")}
-        recorder.data["mapping_verified"] = False  # Caller supplies remote provenance; no attestation.
+            arm: {
+                "url": getattr(args, arm + "_url"),
+                "binary": str(getattr(args, arm + "_binary")),
+                "sha256": sha256(getattr(args, arm + "_binary")),
+            }
+            for arm in ("baseline", "candidate")
+        }
+        recorder.data["mapping_verified"] = (
+            False  # Caller supplies remote provenance; no attestation.
+        )
     recorder.save()
 
 
 def probe(recorder, executable, command):
-    code, output = recorder.run(f"help-{command}", [executable, "bench", command, "--help"], 90)
+    code, output = recorder.run(
+        f"help-{command}", [executable, "bench", command, "--help"], 90
+    )
     available = code == 0 and "usage:" in output.lower()
     if available and "--help=all" in output:
-        code, output = recorder.run(f"help-{command}-all", [executable, "bench", command, "--help=all"], 90)
+        code, output = recorder.run(
+            f"help-{command}-all", [executable, "bench", command, "--help=all"], 90
+        )
         available = code == 0 and "usage:" in output.lower()
-    recorder.data.setdefault("capabilities", {})[command] = {"available": available, "returncode": code}
+    recorder.data.setdefault("capabilities", {})[command] = {
+        "available": available,
+        "returncode": code,
+    }
     recorder.save()
     return output if available else None
 
 
 def parser():
     cli = argparse.ArgumentParser(description=__doc__)
-    cli.add_argument("action", choices=("stress", "serve", "forward", "probe"))
+    cli.add_argument(
+        "action",
+        choices=("stress", "serve", "forward", "probe", "experiment", "report"),
+    )
     cli.add_argument("--stage", type=int, choices=STAGES, default=1)
     cli.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[3])
     cli.add_argument("--base-ref", required=True, help="explicit comparison commit/ref")
-    cli.add_argument("--out-dir", type=Path, required=True, help="new artifact directory; never overwritten")
+    cli.add_argument(
+        "--out-dir",
+        type=Path,
+        required=True,
+        help="new artifact directory; never overwritten",
+    )
     cli.add_argument("--cargo", default="cargo")
     cli.add_argument("--profile", choices=("test", "release"), default="release")
-    cli.add_argument("--vllm", help="explicit vLLM executable; required except for stress")
+    cli.add_argument(
+        "--vllm", help="explicit vLLM executable; required except for stress"
+    )
     cli.add_argument("--repeat", type=positive_int, default=2)
-    cli.add_argument("--stress-rounds", type=positive_int, default=os.environ.get("ROUTER_PD_STRESS_ROUNDS", "24"))
-    cli.add_argument("--stress-concurrency", type=positive_int, default=os.environ.get("ROUTER_PD_STRESS_CONCURRENCY", "16"))
+    cli.add_argument(
+        "--stress-rounds",
+        type=positive_int,
+        default=os.environ.get("ROUTER_PD_STRESS_ROUNDS", "24"),
+    )
+    cli.add_argument(
+        "--stress-concurrency",
+        type=positive_int,
+        default=os.environ.get("ROUTER_PD_STRESS_CONCURRENCY", "16"),
+    )
     cli.add_argument("--timeout", type=positive_float, default=3600)
     cli.add_argument("--baseline-url", type=base_url)
     cli.add_argument("--candidate-url", type=base_url)
@@ -334,6 +579,14 @@ def parser():
     cli.add_argument("--num-prompts", type=positive_int, default=32)
     cli.add_argument("--request-rate", type=positive_float, default=4)
     cli.add_argument("--seed", type=int, default=17)
+    cli.add_argument(
+        "--plan", type=Path, help="PR3 explicit deployment and workload JSON"
+    )
+    cli.add_argument(
+        "--input-dir",
+        type=Path,
+        help="completed PR3 experiment for report regeneration",
+    )
     return cli
 
 
@@ -341,12 +594,25 @@ def main(argv=None):
     cli = parser()
     args = cli.parse_args(argv)
     args.repo, args.out_dir = args.repo.resolve(), args.out_dir.resolve()
-    if args.action != "stress" and not args.vllm:
+    if args.action in ("serve", "forward", "probe") and not args.vllm:
         cli.error("--vllm is required for probe, serve, and forward")
     if args.action in ("serve", "forward") and not args.model:
         cli.error("--model is required")
+    if args.action in ("experiment", "report") and args.stage != 3:
+        cli.error("experiment and report require --stage 3")
+    if args.action == "experiment" and (not args.plan or not args.plan.is_file()):
+        cli.error("experiment requires --plan pointing to an existing JSON file")
+    if args.action == "report" and (not args.input_dir or not args.input_dir.is_dir()):
+        cli.error("report requires --input-dir pointing to experiment evidence")
     if args.action == "serve":
-        if not all((args.baseline_url, args.candidate_url, args.baseline_binary, args.candidate_binary)):
+        if not all(
+            (
+                args.baseline_url,
+                args.candidate_url,
+                args.baseline_binary,
+                args.candidate_binary,
+            )
+        ):
             cli.error("serve requires both URLs and both binary paths")
         for arm in ("baseline", "candidate"):
             path = getattr(args, arm + "_binary").resolve()
@@ -356,75 +622,177 @@ def main(argv=None):
     if not args.repo.is_dir() or args.out_dir.exists():
         cli.error("--repo must exist and --out-dir must be a new directory")
     recorder = Recorder(args.out_dir, args.repo, args.timeout)
-    recorder.data.update(stage=args.stage, action=args.action, parameters=vars(args).copy())
-    recorder.data["parameters"] = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    recorder.data.update(
+        stage=args.stage, action=args.action, parameters=vars(args).copy()
+    )
+    recorder.data["parameters"] = {
+        k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
+    }
     try:
-        if args.action != "probe" and STAGES[args.stage] is None:
-            return recorder.finish("not_implemented", 3, f"PR{args.stage} stress contract is not implemented")
+        if args.action != "probe" and args.stage == 4:
+            return recorder.finish(
+                "not_implemented",
+                3,
+                f"PR{args.stage} stress contract is not implemented",
+            )
+        if args.action in ("experiment", "report") or (
+            args.action == "stress" and args.stage == 3
+        ):
+            provenance(recorder, args)
+            if args.action == "stress":
+                from mock_pd import selftest
+
+                return selftest(recorder, args)
+            from experiment import execute, regenerate
+
+            return (
+                execute(recorder, args.plan, base_url)
+                if args.action == "experiment"
+                else regenerate(recorder, args.input_dir)
+            )
         if args.action == "stress":
             args.cargo = resolve_executable(args.cargo)
         else:
             args.vllm = resolve_executable(args.vllm)
         provenance(recorder, args)
         if args.action == "stress":
-            environment = {"ROUTER_PD_STRESS_ROUNDS": str(args.stress_rounds),
-                           "ROUTER_PD_STRESS_CONCURRENCY": str(args.stress_concurrency)}
+            environment = {
+                "ROUTER_PD_STRESS_ROUNDS": str(args.stress_rounds),
+                "ROUTER_PD_STRESS_CONCURRENCY": str(args.stress_concurrency),
+            }
             for iteration in range(args.repeat):
                 for index, (suite, _, _) in enumerate(STAGES[args.stage]):
                     name = f"stress-{iteration + 1}-{suite}"
-                    code, output = recorder.run(name, cargo_command(args.cargo, args.stage, index, args.profile), env_updates=environment)
+                    code, output = recorder.run(
+                        name,
+                        cargo_command(args.cargo, args.stage, index, args.profile),
+                        env_updates=environment,
+                    )
                     verdict = cargo_verdict(code, output)
-                    hashes = {path: sha256(path) for path in test_artifacts(output) if Path(path).is_file()}
+                    hashes = {
+                        path: sha256(path)
+                        for path in test_artifacts(output)
+                        if Path(path).is_file()
+                    }
                     recorder.data.setdefault("test_binaries", {}).update(hashes)
                     for path in hashes:
                         stat = Path(path).stat()
                         recorder.data.setdefault("test_binary_metadata", {})[path] = {
-                            "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+                            "size_bytes": stat.st_size,
+                            "mtime_ns": stat.st_mtime_ns,
+                        }
                     if verdict != "passed":
-                        return recorder.finish(verdict, 1, "inspect raw output; zero tests are never a pass")
+                        return recorder.finish(
+                            verdict,
+                            1,
+                            "inspect raw output; zero tests are never a pass",
+                        )
                     if not hashes:
-                        return recorder.finish("missing_artifact", 1, "no hashable Cargo test executable was reported")
+                        return recorder.finish(
+                            "missing_artifact",
+                            1,
+                            "no hashable Cargo test executable was reported",
+                        )
                     result = stress_result(output, suite)
-                    if result["rounds"] != args.stress_rounds or result["concurrency"] != args.stress_concurrency:
-                        raise ValueError("stress result parameters differ from requested rounds/concurrency")
-                    (args.out_dir / f"{name}.result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-                    recorder.data.setdefault("stress_results", []).append({"iteration": iteration + 1, "suite": suite, **result})
+                    if (
+                        result["rounds"] != args.stress_rounds
+                        or result["concurrency"] != args.stress_concurrency
+                    ):
+                        raise ValueError(
+                            "stress result parameters differ from requested rounds/concurrency"
+                        )
+                    (args.out_dir / f"{name}.result.json").write_text(
+                        json.dumps(result, indent=2) + "\n", encoding="utf-8"
+                    )
+                    recorder.data.setdefault("stress_results", []).append(
+                        {"iteration": iteration + 1, "suite": suite, **result}
+                    )
                     recorder.save()
-            return recorder.finish("passed", 0, "CPU stress only; no router TTFT or GPU benefit measured")
+            return recorder.finish(
+                "passed", 0, "CPU stress only; no router TTFT or GPU benefit measured"
+            )
         recorder.run("bench-help", [args.vllm, "bench", "--help"], 90)
         if args.action == "probe":
-            serve_help, forward_help = probe(recorder, args.vllm, "serve"), probe(recorder, args.vllm, "forward")
+            serve_help, forward_help = (
+                probe(recorder, args.vllm, "serve"),
+                probe(recorder, args.vllm, "forward"),
+            )
             code = 0 if serve_help is not None and forward_help is not None else 3
-            return recorder.finish("available" if code == 0 else "partial_or_unavailable", code,
-                                   "capability probe only; no benchmark executed")
+            return recorder.finish(
+                "available" if code == 0 else "partial_or_unavailable",
+                code,
+                "capability probe only; no benchmark executed",
+            )
         help_text = probe(recorder, args.vllm, args.action)
         if help_text is None:
-            return recorder.finish("unsupported", 3, f"installed CLI does not support bench {args.action}")
+            return recorder.finish(
+                "unsupported", 3, f"installed CLI does not support bench {args.action}"
+            )
         if args.action == "forward":
             if "--model" not in help_text:
-                return recorder.finish("unsupported", 3, "forward CLI lacks the expected --model interface")
-            code, _ = recorder.run("forward", [args.vllm, "bench", "forward", "--model", args.model])
-            return recorder.finish("diagnostic_completed" if code == 0 else "failed", 0 if code == 0 else 1,
-                                   "GPU forward diagnostic only; bypasses scheduler and cannot measure router TTFT")
+                return recorder.finish(
+                    "unsupported", 3, "forward CLI lacks the expected --model interface"
+                )
+            code, _ = recorder.run(
+                "forward", [args.vllm, "bench", "forward", "--model", args.model]
+            )
+            return recorder.finish(
+                "diagnostic_completed" if code == 0 else "failed",
+                0 if code == 0 else 1,
+                "GPU forward diagnostic only; bypasses scheduler and cannot measure router TTFT",
+            )
         for iteration in range(args.repeat):
-            arms = ("baseline", "candidate") if iteration % 2 == 0 else ("candidate", "baseline")
+            arms = (
+                ("baseline", "candidate")
+                if iteration % 2 == 0
+                else ("candidate", "baseline")
+            )
             for arm in arms:
                 name = f"serve-{iteration + 1}-{arm}"
                 result_dir = args.out_dir / name
-                command = serve_command(args, getattr(args, arm + "_url"), result_dir, args.seed + iteration)
-                missing = [flag for flag in command[3:] if flag.startswith("--") and flag not in help_text]
+                command = serve_command(
+                    args, getattr(args, arm + "_url"), result_dir, args.seed + iteration
+                )
+                missing = [
+                    flag
+                    for flag in command[3:]
+                    if flag.startswith("--") and flag not in help_text
+                ]
                 if missing:
-                    return recorder.finish("unsupported", 3, f"serve CLI is missing required options: {missing}")
+                    return recorder.finish(
+                        "unsupported",
+                        3,
+                        f"serve CLI is missing required options: {missing}",
+                    )
                 result_dir.mkdir()
                 code, _ = recorder.run(name, command)
                 metrics = result_dir / "metrics.json"
                 if code != 0 or not metrics.is_file():
-                    return recorder.finish("failed", 1, f"{name}: nonzero exit or missing metrics.json")
+                    return recorder.finish(
+                        "failed", 1, f"{name}: nonzero exit or missing metrics.json"
+                    )
                 payload = json.loads(metrics.read_text(encoding="utf-8"))
-                if not isinstance(payload, dict) or payload.get("completed", 0) != args.num_prompts:
-                    return recorder.finish("incomplete_requests", 1, f"{name}: completed count differs from requested count")
-        return recorder.finish("completed_unassessed", 0, "raw paired serve runs completed; no performance acceptance decision")
-    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("completed", 0) != args.num_prompts
+                ):
+                    return recorder.finish(
+                        "incomplete_requests",
+                        1,
+                        f"{name}: completed count differs from requested count",
+                    )
+        return recorder.finish(
+            "completed_unassessed",
+            0,
+            "raw paired serve runs completed; no performance acceptance decision",
+        )
+    except (
+        ValueError,
+        OSError,
+        KeyError,
+        TypeError,
+        subprocess.SubprocessError,
+    ) as exc:
         return recorder.finish("error", 1, str(exc))
 
 

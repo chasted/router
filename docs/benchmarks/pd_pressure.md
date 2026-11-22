@@ -1,7 +1,10 @@
 # P/D pressure routing: per-PR stress and benchmark evidence
 
-`scripts/benchmarks/pd_pressure/run.py` is a standard-library runner. It does not
-start a router, a worker, a connector, or Program scheduling. CPU stress and live
+`scripts/benchmarks/pd_pressure/run.py` records per-PR evidence. PR1/2 and the
+official-CLI adapter use the standard library; PR3's HTTP client and fixtures
+also require `aiohttp` (already a project dependency), with Python 3.10+.
+PR3 can start only the processes explicitly declared in an experiment plan.
+Other actions do not launch deployment services. CPU stress and live
 benchmarks are different evidence: CPU tests establish routing/accounting
 behavior; `vllm bench serve` can measure client-observed TTFT through the public
 HTTP API. HTTP P/D is the primary validation path; gRPC P/D remains a
@@ -21,11 +24,11 @@ established separately. The runner does not infer them from an HTTP URL.
 | PR2 admission | Library `routers::http::pd_router::admission_tests::pd_cache_aware_pr2_stress` | Shared shadow/baseline accounting. |
 | PR2 HTTP P/D | Target `pd_pressure_routing`, exact filter `http_pd_pressure_pr2_stress` | Four independent stage-mode combinations. |
 | PR2 gRPC P/D | Target `grpc_pd_routing`, exact filter `grpc_pd_pressure_pr2_stress` | Shadow compatibility and baseline preservation. |
-| PR3 | Not registered | Exits 3 with `not_implemented`; no success claim. |
+| PR3 | Python `mock_pd.selftest`, through `stress --stage 3` | A/A and off/shadow tooling selftests, explicit experiment plans and strict reports. |
 | PR4 | Not registered | Exits 3 with `not_implemented`; no success claim. |
 
-Each later PR must implement its stress test, register its real filter in
-`STAGES`, update the standard-library tests, and document the new evidence before
+Each later PR must implement its stress test, register its actual entry point,
+update the tests, and document the new evidence before
 its entry point can succeed. There is no arbitrary filter override that would
 silently turn an unimplemented stage into a passing stage.
 
@@ -92,9 +95,8 @@ than overwriting a retained reference binary. The global Cargo download cache
 may be reused. A 32-core machine with only 8 GiB assigned to WSL should not use
 32 concurrent compiler jobs without a separate memory check.
 
-For later stages, the same command with `--stage 3` or `4` currently
-records `not_implemented` and exits 3. That is an incomplete validation result,
-not a skipped success.
+`--stage 3` runs the Python tooling selftest described below; it does not invoke
+a Rust test filter. `--stage 4` still records `not_implemented` and exits 3.
 
 ### PR2 CPU shadow stress
 
@@ -114,7 +116,7 @@ The runner rejects incomplete or duplicated cases, incorrect counts, missing
 baseline-preservation assertions, zero tests and missing executable hashes.
 All assertions concern CPU mock routing, observation and lifecycle behavior;
 PR2 keeps actual routing on the baseline and provides no TTFT benefit evidence.
-PR3 and PR4 remain unimplemented runner stages.
+PR3 adds experiment tooling; actual pressure overrides remain a PR4 feature.
 
 ### Configure native P/D pressure observation
 
@@ -308,8 +310,9 @@ does **not** attest that a remote URL is running that file: preserve deployment
 commands, engine/router startup logs, connector settings, model revisions,
 hardware topology, and readiness evidence alongside the run. Avoid concurrent
 baseline and candidate engine workloads competing for the same GPU. Establish
-and record comparable warm-up/cold-cache conditions yourself; the runner never
-flushes caches or restarts workers.
+and record comparable warm-up/cold-cache conditions yourself for this legacy
+`serve` action. PR3's separate `experiment` action executes explicit lifecycle
+hooks; it does not guess how to reset a particular engine or connector.
 
 These small defaults exercise the measurement pipeline. They do not guarantee
 KV pressure, a particular prefix-hit rate, controlled output termination, or
@@ -388,7 +391,172 @@ python3 -B -m unittest discover -s scripts/benchmarks/pd_pressure/tests -v
 The tests cover all three PR1 and PR2 suites and their default two-repeat orchestration,
 tiny sample output, command construction, invalid parameters,
 zero/ignored tests, artifact extraction, evidence preservation, unsupported
-forward handling, and unimplemented stages.
+forward handling, and unimplemented stages. The additional PR3 tests exercise
+real local HTTP streaming, process cleanup, frozen workloads and strict statistics.
+
+## PR3: fixed traces, deployment lifecycle and paired reports
+
+PR3 validates the **measurement tool**, not the pressure-routing performance
+hypothesis. `performance_accepted` is always false. Real NPU or other accelerator
+validation requires a separately prepared deployment; no accelerator is started
+by the CPU selftest. The Python mock simulates a P-to-D handoff in memory and
+exposes two P and two D identities. It is not the production Rust router or a
+real KV connector. Continue running `stress --stage 2` for the actual router's
+HTTP/gRPC routing and lifecycle checks.
+
+### Run the CPU tooling selftest
+
+```bash
+python3 -B scripts/benchmarks/pd_pressure/run.py stress \
+  --stage 3 --base-ref BASE_COMMIT_SHA \
+  --repeat 2 --stress-rounds 4 --stress-concurrency 4 --timeout 120 \
+  --out-dir /absolute/path/to/pr3-selftest
+```
+
+With `N = stress_rounds * stress_concurrency`, each repeat executes A/A and
+off/shadow experiments. Each experiment has two pairs in AB then BA order, with
+N measured requests per arm per pair, and one separately accounted warmup
+request per arm. Thus each repeat measures **8N requests**, plus eight warmup
+requests. Every round must reconcile request, completion and mock handoff
+counts; actual targets remain baseline in off/shadow; process cleanup must be
+recorded. All source, trace, startup, metrics, request and report evidence is
+retained. Fixture timing budgets are intentionally broad functional checks,
+not deployment regression budgets. Two pairs do not establish a confidence
+interval; that field is null rather than pretending the requests are independent.
+
+To inspect and edit a complete, runnable plan instead of using the selftest:
+
+```bash
+python3 -B scripts/benchmarks/pd_pressure/mock_pd.py plan \
+  --directory /absolute/path/to/new-pr3-input \
+  --comparison off_shadow --count 16 --concurrency 4
+python3 -B scripts/benchmarks/pd_pressure/run.py experiment \
+  --stage 3 --base-ref BASE_COMMIT_SHA \
+  --plan /absolute/path/to/new-pr3-input/plan.json \
+  --timeout 120 --out-dir /absolute/path/to/new-pr3-run
+python3 -B scripts/benchmarks/pd_pressure/run.py report \
+  --stage 3 --base-ref BASE_COMMIT_SHA \
+  --input-dir /absolute/path/to/new-pr3-run \
+  --out-dir /absolute/path/to/new-pr3-report
+```
+
+Report regeneration reads the frozen artifacts and performs no HTTP inference.
+It rejects incomplete rounds, missing/duplicated request IDs, contradictory
+timestamps, changed request/metrics files and changed frozen plan/trace hashes.
+An experiment with failed requests can still produce a report, but failed
+requests remain in the denominator and a violated budget exits 1.
+
+### Workload and timing contract
+
+`workload.py` writes a fixed JSONL trace. It supports constant, Poisson and burst
+arrivals with an explicit seed, and preserves the exact same trace for every
+arm and round:
+
+```bash
+python3 -B scripts/benchmarks/pd_pressure/workload.py \
+  --output /absolute/path/to/new-trace.jsonl --model MODEL_ID \
+  --count 64 --rate 8 --seed 17 --arrival poisson \
+  --short-words 32 --long-words 256 --output-tokens 64 \
+  --scenario prefill-pressure
+```
+
+Each record contains `id`, `offset_s`, predeclared `scenario`, `length_group`,
+`prefix_group`, and the exact streaming chat `body`. Synthetic input lengths
+are **word counts**, not tokenizer lengths. Output `max_tokens` is an upper
+bound, not proof of the realized generation length. Server usage, when present,
+is saved per request. Use a tokenizer-verified trace for exact token-length
+experiments; do not relabel requests based on the measured arm's pressure.
+Only one text choice is supported; tool calls and multimodal messages are
+rejected. Put only shareable synthetic prompts in public evidence.
+
+`replay.py` schedules all requests against their original arrival times.
+`concurrency` limits active HTTP calls but does not move arrival times or drop
+queued requests. Each record retains planned time, client-call start, first
+generated content, completion/failure, client lag and observed chunk intervals.
+`sent_ms` is the start of the HTTP call including connection setup, not a wire
+timestamp. Client lag is `sent_ms - planned_ms`; TTFT is
+`first_content_ms - sent_ms`. The additional arrival-to-first-content value
+includes client backlog. Role-only events do not count as generated content;
+nonempty text/reasoning content does. `[DONE]` and generated content are both
+required for completion. Chunk intervals are not token ITL.
+
+HTTP errors, total request timeouts, malformed SSE and EOF without `[DONE]` are
+failures. An interrupted replay preserves records even for unsent requests, and
+the incomplete experiment cannot be reported as valid. Redirects are not
+followed. The current client expects a controlled API without authentication;
+it does not infer credentials or copy proxy settings from the environment.
+
+### Deployment plan contract
+
+The generated fixture plan is a complete schema example, not an NPU deployment
+recipe. Replace its values and commands with the actual environment before
+using `evidence_level: deployment`:
+
+| Field | Required meaning |
+|---|---|
+| `schema_version`, `evidence_level`, `backend_transport` | Version 1; `mock` or `deployment`; HTTP backend. gRPC regression is a separate stage-2 run. |
+| `comparison`, `repeats`, `seed`, `cache_state` | `aa`, `off_shadow`, or `candidate`; at least two pairs; fixed random seed; `cold` or `warm`. |
+| `hardware`, `model`, `connector` | Accelerator kind/description (for example NPU), model/tokenizer revisions and template identity, actual connector name/version/transfer mode. Unknown connector is rejected for deployment evidence. |
+| `trace`, `concurrency`, timeouts | Existing JSONL; active HTTP call limit; request, readiness and telemetry timing parameters. |
+| `budgets` | Predeclare maximum failure fraction, maximum client lag in ms, and maximum mean paired TTFT regression in percent. |
+| `arms.baseline`, `arms.candidate` | Explicit router URL, local binary and source repository, full captured RouterConfig JSON, and both declared stage modes. |
+| `topology` | Stage, inference endpoint/rank, engine ID, instance epoch, layout fingerprint, metrics URL and explicit usage/identity selectors for every worker. Every metrics URL must be sampled. |
+| `telemetry` | Unique source name, stage and exact URL; raw Prometheus bodies and sample times are retained. |
+| `start`, `reset`, `warmup`, `stop` | Arrays of argv arrays, never shell strings; replace `{artifact_dir}`, `{arm}`, `{iteration}` where needed. |
+| `ready_urls` | Health endpoints checked before reset/warmup/measurement. |
+| `require_overrides`, `override_counters` | Stages whose actual override must be exercised, and explicit source/metric/label selectors for the future candidate's actual counter. Missing/ambiguous/reset/zero counters cannot establish override coverage. |
+
+The config modes must agree with the declared modes. The captured config also
+preserves pressure thresholds and mappings; omitted low/high currently mean
+0.70/0.85, matching the Rust configuration. A/A requires identical binary,
+configuration and source state. Baseline and candidate run sequentially in
+alternating order to avoid competing accelerator workloads created by this
+runner. The caller must also exclude unrelated external workloads.
+
+Reset is mandatory every round; warm cache requires a warmup command; cold
+cache rejects one. Command success does not prove the reset actually cleared
+engine caches: verify the backend-specific semantics before performance work.
+Managed startup/cleanup requires Linux/WSL and uses owned process groups only.
+Remote or externally managed services require explicit stop hooks. Runtime
+source/binary/config changes invalidate the experiment. Captured URL/binary
+mappings and live identity claims are not remote-process attestation.
+
+### Statistics and evidence
+
+Each experiment retains `plan.json`, `topology.json`, `trace.jsonl`, source
+patches and untracked contents under `sources/`, binary fingerprints,
+`commands.txt`, per-round process logs, `workers/*.prom` plus sample metadata,
+`requests.jsonl`, `rounds.csv`, `report.json` and `report.md`.
+
+The report groups by predeclared scenario/input group, with a shared cache
+condition. It reports every arm/round's planned, completed, failed and TTFT
+sample counts; completion rate and completed requests/s; p50/p95 TTFT and
+completion latency; and client lag/backlog. A request that emitted first content
+then failed contributes a TTFT sample **and** a failure. A request with no first
+content contributes a failure but no fabricated zero-latency sample.
+
+Percentiles use linear interpolation. For each pair, absolute improvement is
+`baseline_p95_ms - candidate_p95_ms`; relative improvement is that difference
+divided by **baseline** p95, multiplied by 100. Reports retain all raw pair
+values, AB/BA order means and the mean paired improvement. A 95% percentile
+bootstrap resamples whole paired rounds (2,000 draws, fixed seed), requires at
+least three pairs, and allows negative improvements. Independence still depends
+on the deployment's reset protocol. It never treats correlated requests as
+independent experiment repetitions.
+
+`functional_valid` means the recorded experiment is complete and its declared
+budgets/coverage checks passed. It is **not** a production performance verdict.
+`invalid_measurement` exits 1 and includes the violated checks. Required override
+coverage is opt-in: zero overrides are expected for off/shadow and are allowed
+for explicitly declared no-op controls. An on candidate with a required stage
+and no observed overrides is marked unexercised. PR3 does not implement on.
+
+The legacy official `serve` adapter remains useful for cross-checking client
+measurements. It probes the installed help and requests detailed results; it
+does not claim the strict fixed-trace/backlog contract above. `forward` remains
+compute diagnosis only. No performance result is inferred from unavailable CLI
+capabilities. Ruff and the CPU tooling unit tests now cover this script
+directory through `.pre-commit-config.yaml` as well as the documented commands.
 
 References:
 
